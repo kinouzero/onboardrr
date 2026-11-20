@@ -1,0 +1,18 @@
+---
+- name: Install XFCE and TigerVNC for on-demand sessions
+  ansible.builtin.apt:
+    name: [xfce4, dbus-x11, tigervnc-standalone-server, tigervnc-tools]
+    state: present
+    install_recommends: false
+    fail_on_autoremove: true
+
+- name: Provide the operator with a loopback-only VNC launcher
+  ansible.builtin.copy:
+    content: |
+      #!/bin/sh
+      exec tigervncserver -localhost yes -SecurityTypes VncAuth -xstartup /usr/bin/startxfce4
+    dest: "{{ onboardrr_home }}/.config/onboardrr-vnc"
+    mode: "0700"
+    backup: true
+  become: false
+  remote_user: "{{ onboardrr_user }}"

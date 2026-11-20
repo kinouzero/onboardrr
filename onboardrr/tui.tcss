@@ -1,0 +1,385 @@
+Button {
+    height: 3;
+    min-width: 0;
+    padding: 0;
+    border: none;
+    background: $panel;
+    color: $foreground;
+}
+Button.-primary {
+    border: none;
+    background: $primary;
+    color: $onboardrr-primary-ink;
+}
+Button.-warning {
+    border: none;
+    background: $warning;
+    color: $onboardrr-warning-ink;
+}
+Button:hover {
+    tint: $foreground 12%;
+}
+Button:focus {
+    background-tint: $accent 32%;
+    text-style: bold;
+}
+Button.-primary:focus, Button.-warning:focus {
+    background-tint: $foreground 22%;
+}
+Screen {
+    background: $background;
+    color: $foreground;
+}
+#topbar {
+    height: 3;
+    padding: 0 2;
+    background: $panel;
+    align-vertical: middle;
+}
+#brand {
+    width: 1fr;
+    margin-right: 3;
+    color: $accent;
+    text-style: bold;
+}
+#home {
+    width: 12;
+    background: $surface;
+}
+#workspace {
+    height: 1fr;
+    padding: 1 2;
+}
+#sidebar {
+    width: 28;
+    height: 1fr;
+    margin-right: 1;
+    padding: 0 1;
+    background: $surface;
+    border: round $onboardrr-border;
+}
+.section-title {
+    height: 1;
+    color: $onboardrr-muted;
+    text-style: bold;
+    margin: 1 0 0 0;
+}
+#hosts {
+    height: 1fr;
+    background: $surface;
+    scrollbar-size: 1 1;
+}
+#hosts > .datatable--cursor {
+    background: $primary;
+    color: $onboardrr-primary-ink;
+}
+#add-host, #edit-host-profile {
+    width: 1fr;
+    margin: 1 0 0 0;
+}
+#main {
+    height: 1fr;
+    width: 1fr;
+}
+#sections {
+    height: 3;
+}
+#sections Button {
+    width: 1fr;
+    min-width: 0;
+    margin-right: 1;
+}
+#sections Button:last-of-type {
+    margin-right: 0;
+}
+#sections Button.selected {
+    background: $primary;
+    color: $onboardrr-primary-ink;
+    text-style: bold;
+}
+#controls {
+    height: 1fr;
+    padding: 1;
+    scrollbar-size: 1 1;
+    background: $surface;
+    border: round $onboardrr-border;
+}
+#dashboard {
+    display: none;
+    height: 1fr;
+    padding: 0 1;
+}
+#dashboard-host {
+    height: auto;
+    text-style: bold;
+}
+#dashboard-address {
+    height: auto;
+    margin-bottom: 1;
+    color: $onboardrr-muted;
+}
+#host-checkpoint {
+    height: auto;
+    padding: 0 1 1 1;
+    margin: 1 0;
+    background: $onboardrr-highlight;
+    border-left: thick $accent;
+}
+#dashboard-checkpoint {
+    color: $accent;
+    text-style: bold;
+    margin-top: 1;
+}
+#dashboard-hint, #dashboard-storage {
+    height: auto;
+    color: $onboardrr-muted;
+}
+#dashboard-storage-card {
+    height: auto;
+    margin-top: 1;
+    padding: 0 1 1 1;
+    background: $surface;
+    border: round $onboardrr-border;
+}
+#dashboard-actions Button, #wizard-nav Button, Screen.wizard-review #buttons Button {
+    max-width: 26;
+}
+#wizard-position, #wizard-review, #action-config {
+    height: auto;
+}
+#wizard-position {
+    color: $accent;
+    text-style: bold;
+    margin-bottom: 1;
+}
+#wizard-nav, #wizard-position, #wizard-review, #wizard-review-back {
+    display: none;
+}
+#palette {
+    height: 19;
+    max-height: 90%;
+}
+#palette-actions {
+    height: 1fr;
+}
+#auto-components, #compose-files {
+    height: auto;
+    max-height: 11;
+    margin-bottom: 1;
+}
+#device-summary {
+    height: auto;
+    max-height: 2;
+    margin-bottom: 1;
+    text-style: bold;
+    color: $foreground;
+}
+#checkpoint {
+    height: auto;
+    margin-bottom: 1;
+    color: $accent;
+    text-style: bold;
+}
+#guide-hint, #action-hint, #periphery-paths {
+    height: auto;
+    color: $onboardrr-muted;
+}
+#start-add, #start-ssh, #load-compose-files, #back-to-action {
+    width: 30;
+    max-width: 100%;
+}
+#start-add, #start-ssh {
+    margin-top: 1;
+}
+#form-error {
+    height: auto;
+    max-height: 2;
+    color: $error;
+}
+#command-arguments, #ssh-fields, #ssh-key-fields {
+    height: auto;
+}
+.button-row, #mode, #result-bar, .dialog-buttons {
+    height: 3;
+    align-vertical: middle;
+}
+.button-row Button, .dialog-buttons Button {
+    width: 1fr;
+    margin-right: 1;
+}
+.button-row Button:last-of-type, .dialog-buttons Button:last-of-type {
+    margin-right: 0;
+}
+#buttons.unavailable {
+    display: none;
+}
+#interactive-label {
+    width: auto;
+    color: $onboardrr-muted;
+    margin-left: 1;
+    margin-right: 1;
+}
+#results {
+    display: none;
+    height: 1fr;
+    min-height: 7;
+    padding: 0 1;
+    background: $surface;
+    border: round $onboardrr-border;
+}
+#back-to-action {
+    max-width: 45%;
+    margin-right: 1;
+}
+#execution {
+    width: 2fr;
+}
+#status {
+    height: auto;
+    max-height: 2;
+    color: $onboardrr-muted;
+}
+#result-detail {
+    height: auto;
+    max-height: 4;
+    color: $foreground;
+}
+#status.finished {
+    color: $success;
+}
+#status.failed, #add-error {
+    color: $error;
+}
+.progress-row {
+    height: 1;
+}
+.progress-caption {
+    width: 46%;
+    height: 1;
+    color: $onboardrr-muted;
+}
+.progress-row ProgressBar, .progress-row Bar {
+    width: 1fr;
+}
+.progress-row Bar > .bar--indeterminate {
+    color: $accent;
+}
+#output {
+    height: 1fr;
+    background: $surface;
+    scrollbar-size: 1 1;
+}
+Footer {
+    background: $panel;
+}
+ModalScreen {
+    align: center middle;
+    background: $background 75%;
+}
+.dialog {
+    width: 64;
+    max-width: 95%;
+    height: auto;
+    padding: 1 2;
+    background: $panel;
+    border: round $accent;
+}
+.dialog-title {
+    text-style: bold;
+    color: $accent;
+    margin-bottom: 1;
+}
+.command-preview {
+    height: auto;
+    max-height: 7;
+    overflow-y: auto;
+    margin-bottom: 1;
+}
+#add-error {
+    height: auto;
+}
+Screen.narrow #workspace {
+    layout: vertical;
+    padding: 0 1;
+}
+Screen.narrow #sidebar {
+    width: 1fr;
+    height: 6;
+    margin: 0 0 1 0;
+    border: none;
+}
+Screen.narrow #sidebar .section-title {
+    margin: 0;
+}
+Screen.narrow #sidebar #add-host, Screen.narrow #sidebar #edit-host-profile {
+    display: none;
+}
+Screen.narrow #mode Switch {
+    width: 8;
+    padding: 0;
+}
+Screen.compact #topbar {
+    height: 2;
+}
+Screen.compact #home {
+    height: 2;
+}
+Screen.compact #workspace {
+    padding: 0 1;
+}
+Screen.compact #controls {
+    padding: 0 1;
+}
+Screen.compact.narrow #sidebar {
+    height: 5;
+    margin: 0;
+}
+Screen.compact #device-summary {
+    margin: 0;
+}
+Screen.dashboard-view #dashboard {
+    display: block;
+}
+Screen.dashboard-view #home {
+    display: none;
+}
+Screen.dashboard-view #controls, Screen.dashboard-view #buttons,
+Screen.dashboard-view #form-error, Screen.dashboard-view #sections,
+Screen.dashboard-view #device-summary {
+    display: none;
+}
+Screen.wizard-components #sidebar, Screen.wizard-settings #sidebar, Screen.wizard-review #sidebar,
+Screen.wizard-components #sections, Screen.wizard-settings #sections, Screen.wizard-review #sections,
+Screen.wizard-components #device-summary, Screen.wizard-settings #device-summary, Screen.wizard-review #device-summary {
+    display: none;
+}
+Screen.wizard-components #controls, Screen.wizard-settings #controls, Screen.wizard-review #controls {
+    padding: 0 1;
+    background: $background;
+    border: none;
+}
+Screen.wizard-components #wizard-position, Screen.wizard-settings #wizard-position,
+Screen.wizard-review #wizard-position, Screen.wizard-components #wizard-nav,
+Screen.wizard-settings #wizard-nav, Screen.wizard-review #wizard-review,
+Screen.wizard-review #wizard-review-back {
+    display: block;
+}
+Screen.wizard-components #action-config, Screen.wizard-components #buttons,
+Screen.wizard-settings #buttons, Screen.wizard-settings #auto-components,
+Screen.wizard-settings #command, Screen.wizard-settings #action-hint,
+Screen.wizard-review #auto-components, Screen.wizard-review #command,
+Screen.wizard-review #action-config, Screen.wizard-review #action-hint,
+Screen.wizard-review #advanced-options, Screen.wizard-components #wizard-options {
+    display: none;
+}
+Screen.output-focus #controls, Screen.output-focus #sections, Screen.output-focus #buttons,
+Screen.output-focus #form-error, Screen.output-focus #sidebar,
+Screen.output-focus #dashboard, Screen.output-focus #wizard-nav {
+    display: none;
+}
+Screen.output-focus #results {
+    display: block;
+}
+Screen.output-focus #home {
+    display: block;
+}

@@ -1,0 +1,376 @@
+---
+- name: Validate profile and operator inputs
+  tags: [always]
+  ansible.builtin.assert:
+    that:
+      - >-
+        (onboardrr_profile | default('raspberry-pi') == 'raspberry-pi' and
+         ansible_facts.os_family == 'Debian' and ansible_facts.distribution_release == 'trixie' and
+         ansible_facts.architecture == 'aarch64') or
+        (onboardrr_profile | default('raspberry-pi') == 'server' and
+         ((ansible_facts.distribution == 'Debian' and ansible_facts.distribution_release == 'trixie') or
+          (ansible_facts.distribution == 'Ubuntu' and ansible_facts.distribution_release == 'noble') or
+          (ansible_facts.distribution | lower | replace(' ', '') == 'linuxmint' and
+           ansible_facts.distribution_major_version == '22')) and
+         ansible_facts.architecture in ['aarch64', 'x86_64'])
+      - ansible_facts.service_mgr == 'systemd'
+      - onboardrr_name is defined
+      - onboardrr_name is match('^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$')
+      - onboardrr_user is defined
+      - onboardrr_user is match('^[a-zA-Z_][a-zA-Z0-9_.-]*[$]?$')
+    fail_msg: Select Trixie ARM64 for Raspberry Pi or Debian 13, Ubuntu 24.04, or Linux Mint 22.x for server.
+
+- name: Validate server kernel settings
+  tags: [system]
+  ansible.builtin.assert:
+    that:
+      - onboardrr_inotify_instances is not defined or onboardrr_inotify_instances | string is match('^[0-9]+$')
+      - onboardrr_inotify_instances is not defined or 1 <= (onboardrr_inotify_instances | int) <= 2147483647
+      - onboardrr_swappiness is not defined or onboardrr_swappiness | string is match('^[0-9]+$')
+      - onboardrr_swappiness is not defined or 0 <= (onboardrr_swappiness | int) <= 200
+    fail_msg: Provide an inotify instance count between 1 and 2147483647 and swappiness between 0 and 200.
+  when:
+    - onboardrr_component | default('all') in ['all', 'system']
+    - onboardrr_profile | default('raspberry-pi') == 'server'
+
+- name: Find the existing operator account
+  tags: [system, docker, docker-auth, goku-mounts, openbao-agent, vnc]
+  ansible.builtin.getent:
+    database: passwd
+    key: "{{ onboardrr_user }}"
+  register: onboardrr_operator
+
+- name: Record the operator account and home path
+  tags: [system, docker, docker-auth, goku-mounts, openbao-agent, vnc]
+  ansible.builtin.set_fact:
+    onboardrr_account: "{{ onboardrr_operator.ansible_facts.getent_passwd[onboardrr_user] }}"
+    onboardrr_home: "{{ onboardrr_operator.ansible_facts.getent_passwd[onboardrr_user][4] }}"
+
+- name: Prepare Goku mount credentials
+  tags: [goku-mounts]
+  ansible.builtin.include_tasks:
+    file: goku_credentials.yml
+    apply:
+      tags: [goku-mounts]
+  when:
+    - onboardrr_component | default('all') in ['all', 'goku-mounts']
+    - not (onboardrr_system_only | default(false) | bool)
+
+- name: Check for an existing Docker CLI
+  tags: [docker]
+  when: onboardrr_component | default('all') in ['all', 'docker']
+  ansible.builtin.command:
+    argv: [docker, --version]
+  register: onboardrr_docker_cli
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Install the server's operating system tools
+  tags: [system]
+  ansible.builtin.apt:
+    name: [openssh-server, ca-certificates, curl, git, jq, rsync, sudo]
+    state: present
+    update_cache: "{{ not ansible_check_mode }}"
+    cache_valid_time: 3600
+    fail_on_autoremove: true
+  when:
+    - onboardrr_component | default('all') in ['all', 'system']
+    - onboardrr_profile | default('raspberry-pi') == 'server'
+
+- name: Install official Docker CE on a new Linux server
+  tags: [docker]
+  ansible.builtin.include_tasks:
+    file: server_docker.yml
+    apply:
+      tags: [docker]
+  when:
+    - onboardrr_component | default('all') in ['all', 'docker']
+    - onboardrr_profile | default('raspberry-pi') == 'server'
+    - onboardrr_docker_cli.rc != 0
+
+- name: Install Raspberry Pi system tools
+  tags: [system]
+  ansible.builtin.apt:
+    name: [sudo]
+    state: present
+  when:
+    - onboardrr_component | default('all') in ['all', 'system']
+    - onboardrr_profile | default('raspberry-pi') == 'raspberry-pi'
+
+- name: Install Raspberry Pi Docker and Compose
+  tags: [docker]
+  ansible.builtin.apt:
+    name: [docker.io, docker-cli, docker-compose]
+    state: present
+    update_cache: "{{ not ansible_check_mode }}"
+    cache_valid_time: "{{ 3600 if not ansible_check_mode else 0 }}"
+  when:
+    - onboardrr_component | default('all') in ['all', 'docker']
+    - onboardrr_profile | default('raspberry-pi') == 'raspberry-pi'
+    - onboardrr_docker_cli.rc != 0
+
+- name: Install Goku mount tools
+  tags: [goku-mounts]
+  ansible.builtin.apt:
+    name: [cifs-utils, nfs-common]
+    state: present
+  when:
+    - onboardrr_component | default('all') in ['all', 'goku-mounts']
+
+- name: Allow the operator to reboot and power off without a password
+  tags: [system]
+  when: onboardrr_component | default('all') in ['all', 'system']
+  ansible.builtin.copy:
+    dest: /etc/sudoers.d/99-onboardrr-power
+    content: |
+      # Managed by Onboardrr.
+      {{ onboardrr_user }} ALL=(root) NOPASSWD: /usr/bin/systemctl reboot, /usr/bin/systemctl poweroff, /usr/sbin/reboot "", /usr/sbin/poweroff "", /usr/sbin/shutdown now, /usr/sbin/shutdown -h now
+    owner: root
+    group: root
+    mode: "0440"
+    follow: false
+    validate: /usr/sbin/visudo -cf %s
+
+- name: Prepare Bluetooth
+  tags: [bluetooth]
+  when: onboardrr_component | default('all') in ['all', 'bluetooth']
+  ansible.builtin.include_tasks:
+    file: bluetooth.yml
+    apply:
+      tags: [bluetooth]
+
+- name: Enable and start Docker
+  tags: [docker]
+  ansible.builtin.systemd_service:
+    name: docker
+    enabled: true
+    state: started
+  when:
+    - onboardrr_component | default('all') in ['all', 'docker']
+    - not ansible_check_mode or onboardrr_docker_cli.rc == 0
+
+- name: Check installed Compose and Docker Engine
+  tags: [docker]
+  ansible.builtin.command:
+    argv: "{{ item }}"
+  loop:
+    - [docker, compose, version]
+    - [docker, info, --format, "{{ '{{.ServerVersion}}' }}"]
+  changed_when: false
+  when:
+    - onboardrr_component | default('all') in ['all', 'docker']
+    - not ansible_check_mode
+
+- name: Prepare the device Docker bridge
+  tags: [docker]
+  when:
+    - onboardrr_component | default('all') in ['all', 'docker']
+    - not ansible_check_mode
+    - onboardrr_device_id | default('') is match('^[0-9a-f-]{36}$')
+  block:
+    - name: Inspect the device Docker network
+      ansible.builtin.command:
+        argv: [docker, network, ls, --filter, "name=^{{ onboardrr_name }}$", --format, "{{ '{{.Driver}} {{.Scope}}' }}"]
+      register: onboardrr_bridge
+      changed_when: false
+
+    - name: Verify the device Docker network type
+      ansible.builtin.assert:
+        that: onboardrr_bridge.stdout_lines in [[], ['bridge local']]
+        fail_msg: The device name is already used by a different Docker network.
+
+    - name: Create the dedicated device Docker bridge
+      ansible.builtin.command:
+        argv: [docker, network, create, --driver, bridge, --label, "onboardrr.device-id={{ onboardrr_device_id }}", "{{ onboardrr_name }}"]
+      when: not onboardrr_bridge.stdout_lines
+
+- name: Permit the sudo-capable operator to use Docker
+  tags: [docker]
+  ansible.builtin.user:
+    name: "{{ onboardrr_user }}"
+    groups: docker
+    append: true
+  when:
+    - onboardrr_component | default('all') in ['all', 'docker']
+    - not ansible_check_mode or onboardrr_docker_cli.rc == 0
+
+- name: Prepare operator directories
+  tags: [system]
+  when: onboardrr_component | default('all') in ['all', 'system']
+  ansible.builtin.file:
+    path: "{{ onboardrr_home }}/{{ item }}"
+    state: directory
+    follow: false
+  become: false
+  remote_user: "{{ onboardrr_user }}"
+  loop: [.docker, .logs, scripts, .config, .config/docker]
+
+- name: Authenticate the operator to Docker Hub
+  tags: [docker-auth]
+  when:
+    - onboardrr_component | default('all') in ['all', 'docker-auth']
+    - not ansible_check_mode and onboardrr_docker_auth is defined
+  become: false
+  remote_user: "{{ onboardrr_user }}"
+  block:
+    - name: Provide the Docker Hub token through standard input
+      ansible.builtin.command:
+        argv:
+          - /bin/sh
+          - -c
+          - "{{ lookup('ansible.builtin.file', 'docker-login.sh') }}"
+          - onboardrr-docker-login
+          - docker
+          - "{{ onboardrr_home }}"
+          - "{{ onboardrr_docker_auth.username }}"
+        stdin: "{{ onboardrr_docker_auth.token }}"
+      register: onboardrr_docker_login
+      failed_when: false
+      no_log: true
+
+    - name: Verify Docker Hub login
+      ansible.builtin.assert:
+        that: onboardrr_docker_login.rc == 0
+        fail_msg: Docker Hub login failed. Check the operator's Docker configuration, token, and registry reachability.
+        quiet: true
+
+- name: Establish Goku mounts
+  tags: [goku-mounts]
+  ansible.builtin.include_tasks:
+    file: goku_mounts.yml
+    apply:
+      tags: [goku-mounts]
+  when:
+    - onboardrr_component | default('all') in ['all', 'goku-mounts']
+    - not (onboardrr_system_only | default(false) | bool)
+
+- name: Install the operator's Compose aliases
+  tags: [docker]
+  when: onboardrr_component | default('all') in ['all', 'docker']
+  ansible.builtin.include_tasks:
+    file: shell_aliases.yml
+    apply:
+      tags: [docker]
+
+- name: Provision OpenBao Agent for Compose secrets
+  tags: [openbao-agent]
+  ansible.builtin.include_tasks:
+    file: compose_agent.yml
+    apply:
+      tags: [openbao-agent]
+  when:
+    - onboardrr_component | default('all') in ['all', 'openbao-agent']
+    - onboardrr_compose_agent is defined
+
+- name: Configure the requested server inotify limit
+  tags: [system]
+  ansible.posix.sysctl:
+    name: fs.inotify.max_user_instances
+    value: "{{ onboardrr_inotify_instances }}"
+    sysctl_file: /etc/sysctl.d/90-onboardrr-inotify.conf
+    sysctl_set: true
+    reload: false
+  when:
+    - onboardrr_component | default('all') in ['all', 'system']
+    - onboardrr_profile | default('raspberry-pi') == 'server'
+    - onboardrr_inotify_instances is defined
+
+- name: Configure the requested server swap preference
+  tags: [system]
+  ansible.posix.sysctl:
+    name: vm.swappiness
+    value: "{{ onboardrr_swappiness }}"
+    sysctl_file: /etc/sysctl.d/99-z-onboardrr-swappiness.conf
+    sysctl_set: true
+    reload: false
+  when:
+    - onboardrr_component | default('all') in ['all', 'system']
+    - onboardrr_profile | default('raspberry-pi') == 'server'
+    - onboardrr_swappiness is defined
+
+- name: Prepare NVIDIA support when requested
+  tags: [nvidia]
+  ansible.builtin.include_tasks:
+    file: server_nvidia.yml
+    apply:
+      tags: [nvidia]
+  when:
+    - onboardrr_component | default('all') in ['all', 'nvidia']
+    - onboardrr_profile | default('raspberry-pi') == 'server'
+    - onboardrr_nvidia | default(false) | bool
+
+- name: Prepare a VNC desktop when requested
+  tags: [vnc]
+  ansible.builtin.include_tasks:
+    file: server_vnc.yml
+    apply:
+      tags: [vnc]
+  when:
+    - onboardrr_component | default('all') in ['all', 'vnc']
+    - onboardrr_profile | default('raspberry-pi') == 'server'
+    - onboardrr_vnc | default(false) | bool
+
+- name: Check for a required reboot
+  tags: [system, nvidia]
+  when: onboardrr_component | default('all') in ['all', 'system', 'nvidia']
+  ansible.builtin.stat:
+    path: /run/reboot-required
+  register: onboardrr_reboot
+
+- name: Restart only when the operator allowed it and the system requires it
+  tags: [system, nvidia]
+  ansible.builtin.reboot:
+    reboot_timeout: 300
+  when:
+    - onboardrr_component | default('all') in ['all', 'system', 'nvidia']
+    - onboardrr_reboot.stat.exists
+    - onboardrr_allow_reboot | default(false) | bool
+    - not ansible_check_mode
+
+- name: Report a required reboot that was deferred
+  tags: [system, nvidia]
+  ansible.builtin.fail:
+    msg: A reboot is required. Re-run with onboardrr_allow_reboot=true after arranging access.
+  when:
+    - onboardrr_component | default('all') in ['all', 'system', 'nvidia']
+    - onboardrr_reboot.stat.exists
+    - not (onboardrr_allow_reboot | default(false) | bool)
+    - not ansible_check_mode
+
+- name: Verify that the requested NVIDIA driver can see the GPU
+  tags: [nvidia]
+  ansible.builtin.command:
+    argv: [nvidia-smi, -L]
+  register: onboardrr_nvidia_gpu
+  changed_when: false
+  failed_when: false
+  when:
+    - onboardrr_component | default('all') in ['all', 'nvidia']
+    - onboardrr_profile | default('raspberry-pi') == 'server'
+    - onboardrr_nvidia | default(false) | bool
+    - not ansible_check_mode
+
+- name: Report a driver that is not ready
+  tags: [nvidia]
+  ansible.builtin.assert:
+    that: onboardrr_nvidia_gpu.rc == 0
+    fail_msg: The NVIDIA driver cannot see a GPU. Check for a pending reboot, a driver mismatch, or unsigned modules under Secure Boot.
+  when:
+    - onboardrr_component | default('all') in ['all', 'nvidia']
+    - not (onboardrr_nvidia_gpu.skipped | default(false))
+
+- name: Verify mounts after preparation or reboot
+  tags: [goku-mounts]
+  ansible.builtin.command:
+    argv: [findmnt, --mountpoint, "{{ item.path }}", --noheadings, --raw, --output, "SOURCE,FSTYPE"]
+  loop: "{{ onboardrr_goku_mounts | default([]) }}"
+  register: onboardrr_final_mount
+  changed_when: false
+  failed_when: >-
+    onboardrr_final_mount.rc != 0 or
+    onboardrr_final_mount.stdout.strip() not in
+    [item.source ~ ' ' ~ item.fstype, (item.active_source | default(item.source)) ~ ' ' ~ item.fstype]
+  when:
+    - onboardrr_component | default('all') in ['all', 'goku-mounts']
+    - not ansible_check_mode and not (onboardrr_system_only | default(false) | bool)

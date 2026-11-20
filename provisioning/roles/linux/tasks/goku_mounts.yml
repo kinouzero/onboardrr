@@ -1,0 +1,35 @@
+---
+- name: Select the base Goku mounts
+  ansible.builtin.set_fact:
+    onboardrr_goku_mounts:
+      - path: "{{ onboardrr_home }}/.docker/compose"
+        source: "{{ onboardrr_cifs_source }}"
+        fstype: cifs
+        options: "{{ onboardrr_cifs_options }}"
+        local_workspace: "{{ onboardrr_home }}/.docker/compose/{{ onboardrr_name }}"
+      - path: "/share/docker/komodo/data/{{ onboardrr_name }}"
+        source: "{{ onboardrr_nfs_source }}"
+        fstype: nfs4
+        options: _netdev,nofail,vers=4
+    onboardrr_goku_cifs_options: "{{ onboardrr_cifs_options }}"
+  vars:
+    onboardrr_cifs_options: "_netdev,nofail,noserverino,credentials={{ onboardrr_smb_credentials_file }},uid={{ onboardrr_account[1] }},gid={{ onboardrr_account[2] }}"
+
+- name: Add optional server mounts
+  ansible.builtin.set_fact:
+    onboardrr_goku_mounts: "{{ onboardrr_goku_mounts + [onboardrr_extra_mount] }}"
+  vars:
+    onboardrr_extra_mount:
+      path: "{{ '/mnt/goku_plex' if item.key == 'plex' else onboardrr_home ~ '/' ~ item.key }}"
+      source: "{{ item.value }}"
+      active_source: "{{ item.value | regex_replace('^(//[^/]+/[^/]+)(/.*)$', '\\1[\\2]') }}"
+      fstype: cifs
+      options: "{{ onboardrr_goku_cifs_options }}"
+  loop: "{{ onboardrr_optional_mounts | default({}) | dict2items }}"
+
+- name: Configure the persistent Goku mounts
+  ansible.builtin.include_tasks: mount.yml
+  loop: "{{ onboardrr_goku_mounts }}"
+  loop_control:
+    loop_var: onboardrr_mount
+    label: "{{ onboardrr_mount.path }}"

@@ -1,0 +1,120 @@
+---
+- name: Detect an NVIDIA GPU
+  ansible.builtin.shell: |
+    for device in /sys/bus/pci/devices/*; do
+        [ "$(cat "$device/vendor" 2>/dev/null)" = 0x10de ] || continue
+        case "$(cat "$device/class" 2>/dev/null)" in
+            0x03*) exit 0 ;;
+        esac
+    done
+    exit 1
+  register: onboardrr_nvidia_pci
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Require compatible hardware for the NVIDIA option
+  ansible.builtin.assert:
+    that: onboardrr_nvidia_pci.rc == 0
+    fail_msg: NVIDIA support requires a visible NVIDIA display or 3D controller.
+
+- name: Check the existing NVIDIA driver
+  ansible.builtin.command:
+    argv: [nvidia-smi, -L]
+  register: onboardrr_nvidia_driver
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Validate the requested NVIDIA distribution driver
+  ansible.builtin.assert:
+    that: onboardrr_nvidia_driver_package | default('') is match('^nvidia-driver(-[a-z0-9]+)*$')
+    fail_msg: Supply the distribution's NVIDIA driver package with --nvidia-driver-package when the driver is missing or unavailable.
+  when: onboardrr_nvidia_driver.rc != 0
+
+- name: Install the selected NVIDIA driver package
+  ansible.builtin.apt:
+    name: "{{ onboardrr_nvidia_driver_package }}"
+    state: present
+    fail_on_autoremove: true
+  when: onboardrr_nvidia_driver.rc != 0
+
+- name: Detect an installed NVIDIA Container Toolkit
+  ansible.builtin.command:
+    argv: [nvidia-ctk, --version]
+  register: onboardrr_nvidia_ctk
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Configure and install the NVIDIA Container Toolkit
+  ansible.builtin.include_tasks: vendor_apt.yml
+  vars:
+    onboardrr_vendor: nvidia-container-toolkit
+    onboardrr_vendor_pattern: '(?m)^[^\S\n]*(?:deb(?:-src)?\s|URIs:\s)[^\n]*https?://nvidia\.github\.io/libnvidia-container/'
+    onboardrr_vendor_key_url: https://nvidia.github.io/libnvidia-container/gpgkey
+    onboardrr_vendor_source: |
+      URIs: https://nvidia.github.io/libnvidia-container/stable/deb/{{ 'amd64' if ansible_facts.architecture == 'x86_64' else 'arm64' }}/
+      Suites: /
+    onboardrr_vendor_packages: [nvidia-container-toolkit]
+  when: onboardrr_nvidia_ctk.rc != 0
+
+- name: Preview NVIDIA runtime configuration on a new installation
+  ansible.builtin.debug:
+    msg: Will load the NVIDIA runtime after Docker and the NVIDIA Container Toolkit are installed.
+  when: ansible_check_mode and (onboardrr_nvidia_ctk.rc != 0 or onboardrr_docker_cli.rc != 0)
+
+- name: Register the NVIDIA runtime with Docker
+  when: not ansible_check_mode or (onboardrr_nvidia_ctk.rc == 0 and onboardrr_docker_cli.rc == 0)
+  block:
+    - name: Check the runtimes loaded by Docker
+      ansible.builtin.command:
+        argv: [docker, --host, "unix:///var/run/docker.sock", info, --format, "{{ '{{json .Runtimes}}' }}"]
+      register: onboardrr_docker_runtimes
+      changed_when: false
+      check_mode: false
+
+    - name: Configure a missing NVIDIA runtime
+      when: "'nvidia' not in (onboardrr_docker_runtimes.stdout | from_json)"
+      block:
+        - name: Generate the merged Docker daemon configuration
+          ansible.builtin.command:
+            argv: [nvidia-ctk, runtime, configure, --runtime=docker, --dry-run]
+          register: onboardrr_nvidia_daemon_config
+          changed_when: false
+          check_mode: false
+          no_log: true
+
+        - name: Ensure the Docker daemon configuration directory exists
+          ansible.builtin.file:
+            path: /etc/docker
+            state: directory
+            owner: root
+            group: root
+            mode: "0755"
+
+        - name: Validate and install the merged Docker daemon configuration
+          ansible.builtin.copy:
+            content: "{{ onboardrr_nvidia_daemon_config.stdout | from_json | to_nice_json }}\n"
+            dest: /etc/docker/daemon.json
+            owner: root
+            group: root
+            mode: "0600"
+            backup: true
+            validate: dockerd --validate --config-file %s
+          diff: false
+          no_log: true
+
+        - name: Restart Docker to load the new runtime
+          ansible.builtin.systemd_service:
+            name: docker
+            state: restarted
+          when: not ansible_check_mode
+
+        - name: Verify the NVIDIA runtime is loaded
+          ansible.builtin.command:
+            argv: [docker, --host, "unix:///var/run/docker.sock", info, --format, "{{ '{{json .Runtimes}}' }}"]
+          register: onboardrr_nvidia_runtime
+          changed_when: false
+          failed_when: onboardrr_nvidia_runtime.rc != 0 or 'nvidia' not in (onboardrr_nvidia_runtime.stdout | from_json)
+          when: not ansible_check_mode

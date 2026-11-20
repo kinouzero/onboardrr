@@ -1,0 +1,8 @@
+---
+- name: Prepare an Onboardrr Linux host
+  hosts: all
+  gather_facts: true
+  become: true
+  serial: 1
+  roles:
+    - linux

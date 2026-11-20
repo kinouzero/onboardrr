@@ -1,0 +1,218 @@
+---
+- name: Configure the Raspberry Pi Wi-Fi fallback
+  hosts: all
+  gather_facts: false
+  serial: 1
+  environment:
+    LC_ALL: C
+  tasks:
+    - name: Read the current SSH connection
+      ansible.builtin.setup:
+        filter: ansible_env
+
+    - name: Require an identifiable SSH session
+      ansible.builtin.assert:
+        that: (ansible_facts.env.SSH_CONNECTION | default('')).split() | length == 4
+        fail_msg: Run the Wi-Fi step over a direct SSH connection.
+
+    - name: Determine the interface used for the current SSH connection
+      ansible.builtin.command:
+        argv: [ip, -j, route, get, "{{ ansible_facts.env.SSH_CONNECTION.split()[0] }}", from, "{{ ansible_facts.env.SSH_CONNECTION.split()[2] }}"]
+      register: onboardrr_wifi_route
+      changed_when: false
+      check_mode: false
+
+    - name: Identify the SSH and wireless interfaces
+      ansible.builtin.command:
+        argv: [nmcli, -g, GENERAL.TYPE, device, show, "{{ item }}"]
+      loop:
+        - "{{ (onboardrr_wifi_route.stdout | from_json)[0].dev }}"
+        - "{{ onboardrr_wifi_interface }}"
+      register: onboardrr_wifi_types
+      changed_when: false
+      check_mode: false
+
+    - name: Read the Wi-Fi radio state
+      ansible.builtin.command:
+        argv: [nmcli, radio, wifi]
+      register: onboardrr_wifi_radio
+      changed_when: false
+      check_mode: false
+
+    - name: Read active NetworkManager profiles
+      ansible.builtin.command:
+        argv: [nmcli, -t, -f, "UUID,DEVICE", connection, show, --active]
+      register: onboardrr_wifi_connections
+      changed_when: false
+      check_mode: false
+
+    - name: Identify the active wireless profile
+      ansible.builtin.set_fact:
+        onboardrr_wifi_previous_uuid: >-
+          {{ onboardrr_wifi_connections.stdout_lines
+             | select('search', ':' ~ (onboardrr_wifi_interface | regex_escape) ~ '$')
+             | map('regex_replace', ':.*$', '') | first | default('') }}
+
+    - name: Show the connection and Wi-Fi adapter status
+      ansible.builtin.debug:
+        msg:
+          ssh_interface: "{{ (onboardrr_wifi_route.stdout | from_json)[0].dev }}"
+          ssh_type: "{{ onboardrr_wifi_types.results[0].stdout }}"
+          wifi_interface: "{{ onboardrr_wifi_interface }}"
+          wifi_type: "{{ onboardrr_wifi_types.results[1].stdout }}"
+          wifi_radio: "{{ onboardrr_wifi_radio.stdout }}"
+          wifi_active: "{{ onboardrr_wifi_previous_uuid != '' }}"
+          wifi_band_requested: "{{ onboardrr_wifi_band | default(None) }}"
+
+    - name: Apply Wi-Fi only with wired access
+      when: not ansible_check_mode
+      block:
+        - name: Protect the management connection and existing wireless profiles
+          ansible.builtin.assert:
+            that:
+              - onboardrr_wifi_types.results[0].stdout == 'ethernet'
+              - onboardrr_wifi_types.results[1].stdout == 'wifi'
+              - onboardrr_wifi_radio.stdout == 'enabled'
+              - >-
+                not onboardrr_wifi_previous_uuid or onboardrr_wifi_previous_uuid in
+                (onboardrr_wifi_switchable_uuids | default([onboardrr_wifi_uuid]))
+            fail_msg: Use wired SSH with an enabled Wi-Fi adapter. An active profile outside Onboardrr cannot be replaced.
+
+        - name: Check the wired IPv4 and IPv6 route metrics
+          ansible.builtin.command:
+            argv: [ip, -j, "{{ item }}", route, show, dev, "{{ (onboardrr_wifi_route.stdout | from_json)[0].dev }}"]
+          loop: ['-4', '-6']
+          register: onboardrr_wired_defaults
+          changed_when: false
+
+        - name: Require the existing wired routes to stay preferred
+          ansible.builtin.assert:
+            that: >-
+              (item.stdout | from_json) | selectattr('metric', 'defined')
+              | selectattr('metric', 'ge', onboardrr_wifi_metric) | list | length == 0
+            fail_msg: The configured wired route metric must be lower than the Wi-Fi fallback metric.
+          loop: "{{ onboardrr_wired_defaults.results }}"
+
+        - name: Install and verify the Wi-Fi profile
+          become: true
+          block:
+            - name: Verify the previously active profile comes from the managed keyfile
+              when: onboardrr_wifi_previous_uuid and onboardrr_wifi_previous_uuid != onboardrr_wifi_uuid
+              block:
+                - name: Read NetworkManager profile locations
+                  ansible.builtin.command:
+                    argv: [nmcli, -t, --escape, 'no', -f, "UUID,FILENAME", connection, show]
+                  register: onboardrr_wifi_files
+                  changed_when: false
+
+                - name: Require the exact managed keyfile before changing bands
+                  ansible.builtin.assert:
+                    that: >-
+                      (onboardrr_wifi_previous_uuid ~ ':/etc/NetworkManager/system-connections/onboardrr-'
+                      ~ onboardrr_wifi_previous_uuid ~ '.nmconnection') in onboardrr_wifi_files.stdout_lines
+                    fail_msg: The active Wi-Fi profile is outside the Onboardrr keyfile location.
+
+            - name: Install the private NetworkManager profile
+              ansible.builtin.copy:
+                content: "{{ onboardrr_wifi_profile_b64 | b64decode }}"
+                dest: "{{ onboardrr_wifi_path }}"
+                owner: root
+                group: root
+                mode: "0600"
+                force: false
+                follow: false
+              diff: false
+              no_log: true
+              register: onboardrr_wifi_copy
+
+            - name: Verify profile type, permissions, and content
+              ansible.builtin.stat:
+                path: "{{ onboardrr_wifi_path }}"
+                checksum_algorithm: sha256
+                follow: false
+              register: onboardrr_wifi_file
+              no_log: true
+
+            - name: Require the expected root-owned profile
+              ansible.builtin.assert:
+                that:
+                  - onboardrr_wifi_file.stat.isreg | default(false)
+                  - onboardrr_wifi_file.stat.uid == 0
+                  - onboardrr_wifi_file.stat.mode == '0600'
+                  - onboardrr_wifi_file.stat.checksum == onboardrr_wifi_profile_checksum
+                fail_msg: The reserved profile path has different content or unsafe permissions.
+              no_log: true
+
+            - name: Load the persistent profile
+              ansible.builtin.command:
+                argv: [nmcli, connection, load, "{{ onboardrr_wifi_path }}"]
+              when: onboardrr_wifi_copy.changed or (onboardrr_wifi_uuid ~ ':' ~ onboardrr_wifi_interface) not in onboardrr_wifi_connections.stdout_lines
+              changed_when: onboardrr_wifi_copy.changed
+
+            - name: Activate the profile on the wireless interface
+              ansible.builtin.command:
+                argv: [nmcli, --wait, '25', connection, up, uuid, "{{ onboardrr_wifi_uuid }}", ifname, "{{ onboardrr_wifi_interface }}"]
+              when: (onboardrr_wifi_uuid ~ ':' ~ onboardrr_wifi_interface) not in onboardrr_wifi_connections.stdout_lines
+              changed_when: true
+              register: onboardrr_wifi_activation
+
+            - name: Confirm that the selected Wi-Fi profile is active
+              ansible.builtin.command:
+                argv: [nmcli, -t, -f, "UUID,DEVICE", connection, show, --active]
+              register: onboardrr_wifi_selected
+              changed_when: false
+              failed_when: >-
+                onboardrr_wifi_selected.rc != 0 or
+                (onboardrr_wifi_uuid ~ ':' ~ onboardrr_wifi_interface) not in onboardrr_wifi_selected.stdout_lines
+
+            - name: Verify the wireless IPv4 address
+              ansible.builtin.command:
+                argv: [nmcli, -g, IP4.ADDRESS, device, show, "{{ onboardrr_wifi_interface }}"]
+              register: onboardrr_wifi_address
+              changed_when: false
+              failed_when: onboardrr_wifi_address.rc != 0 or not onboardrr_wifi_address.stdout
+
+            - name: Confirm the existing SSH route remains wired
+              ansible.builtin.command:
+                argv: "{{ onboardrr_wifi_route.cmd }}"
+              register: onboardrr_wifi_verified_route
+              changed_when: false
+              failed_when: >-
+                onboardrr_wifi_verified_route.rc != 0 or
+                (onboardrr_wifi_verified_route.stdout | from_json)[0].dev !=
+                (onboardrr_wifi_route.stdout | from_json)[0].dev
+          rescue:
+            - name: Unload the profile created by this run
+              ansible.builtin.command:
+                argv: [nmcli, connection, delete, uuid, "{{ onboardrr_wifi_uuid }}"]
+              register: onboardrr_wifi_unload
+              failed_when: false
+              changed_when: onboardrr_wifi_unload.rc == 0
+              when: onboardrr_wifi_copy.changed | default(false)
+
+            - name: Remove the new profile file on failure
+              ansible.builtin.file:
+                path: "{{ onboardrr_wifi_path }}"
+                state: absent
+              when: onboardrr_wifi_copy.changed | default(false)
+
+            - name: Reconnect the previous managed profile if switching failed
+              ansible.builtin.command:
+                argv: [nmcli, --wait, '25', connection, up, uuid, "{{ onboardrr_wifi_previous_uuid }}",
+                       ifname, "{{ onboardrr_wifi_interface }}"]
+              when:
+                - onboardrr_wifi_previous_uuid and onboardrr_wifi_previous_uuid != onboardrr_wifi_uuid
+                - onboardrr_wifi_activation is defined and not (onboardrr_wifi_activation.skipped | default(false))
+              register: onboardrr_wifi_restore
+              failed_when: false
+              changed_when: onboardrr_wifi_restore.rc == 0
+
+            - name: Report that Wi-Fi activation could not be verified
+              ansible.builtin.fail:
+                msg: >-
+                  Wi-Fi configuration failed verification. Check the regulatory country, band, network, and credentials over Ethernet.
+                  {{ 'The previous Wi-Fi profile could not be restored.' if (onboardrr_wifi_restore.rc | default(0)) != 0 else '' }}
+
+        - name: Show the verified wireless address
+          ansible.builtin.debug:
+            var: onboardrr_wifi_address.stdout_lines

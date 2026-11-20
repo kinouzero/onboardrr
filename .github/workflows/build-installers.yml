@@ -1,0 +1,154 @@
+name: Build Onboardrr installers
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  wheel:
+    name: Python wheel
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt build
+      - name: Check source and tag
+        shell: bash
+        run: |
+          version=$(python -c 'from onboardrr import __version__; print(__version__)')
+          if [[ "$GITHUB_REF_TYPE" == tag && "$GITHUB_REF_NAME" != "v$version" ]]; then
+            printf 'Expected tag v%s for this source version; received %s\n' "$version" "$GITHUB_REF_NAME" >&2
+            exit 1
+          fi
+          python -m unittest discover -s tests -q
+      - name: Build the distributions and test the wheel
+        shell: bash
+        run: |
+          python -m build
+          wheels=(dist/*.whl)
+          test "${#wheels[@]}" -eq 1
+          python -m venv "$RUNNER_TEMP/onboardrr-wheel"
+          "$RUNNER_TEMP/onboardrr-wheel/bin/python" -m pip install "${wheels[0]}"
+          python distribution/smoke.py "$RUNNER_TEMP/onboardrr-wheel/bin/onboardrr"
+          (cd dist && sha256sum -- *.whl *.tar.gz > SHA256SUMS)
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: onboardrr-wheel
+          path: |
+            dist/*.whl
+            dist/*.tar.gz
+            dist/SHA256SUMS
+          if-no-files-found: error
+
+  native:
+    name: Native executable (${{ matrix.target }})
+    needs: wheel
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x86_64
+            runner: ubuntu-22.04
+          - target: linux-arm64
+            runner: ubuntu-22.04-arm
+          - target: macos-x86_64
+            runner: macos-15-intel
+          - target: macos-arm64
+            runner: macos-15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install build dependencies
+        run: python -m pip install -r requirements.txt pyinstaller==6.22.3
+      - name: Build and test the executable
+        run: |
+          python -m PyInstaller --noconfirm distribution/onboardrr.spec
+          python distribution/smoke.py dist/onboardrr
+      - name: Archive the executable and write its checksum
+        shell: bash
+        env:
+          ONBOARDRR_TARGET: ${{ matrix.target }}
+        run: |
+          version=$(python -c 'from onboardrr import __version__; print(__version__)')
+          archive="onboardrr-${version}-${ONBOARDRR_TARGET}.tar.gz"
+          mkdir -p artifacts
+          tar -czf "artifacts/$archive" -C dist onboardrr
+          (cd artifacts && shasum -a 256 "$archive" > "$archive.sha256")
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: onboardrr-${{ matrix.target }}
+          path: artifacts/*
+          if-no-files-found: error
+
+  publish-github:
+    name: Publish GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [wheel, native]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: onboardrr-*
+          path: release
+          merge-multiple: true
+      - name: Publish the verified distribution files
+        working-directory: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          sha256sum --check SHA256SUMS
+          for checksum in *.tar.gz.sha256; do
+            sha256sum --check "$checksum"
+          done
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" --clobber -- *
+            gh release edit "$RELEASE_TAG" --target "$RELEASE_BRANCH"
+          else
+            gh release create "$RELEASE_TAG" --target "$RELEASE_BRANCH" --verify-tag --generate-notes -- *
+          fi
+
+  publish-pypi:
+    name: Publish to PyPI
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [wheel, publish-github]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/onboardrr/
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: onboardrr-wheel
+          path: python-release
+      - name: Prepare PyPI distributions
+        run: |
+          (cd python-release && sha256sum --check SHA256SUMS)
+          mkdir dist
+          mv python-release/*.whl python-release/*.tar.gz dist/
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3

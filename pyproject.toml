@@ -1,0 +1,45 @@
+[build-system]
+requires = ["hatchling>=1.27,<2", "hatch-requirements-txt>=0.4,<1"]
+build-backend = "hatchling.build"
+
+[project]
+name = "onboardrr"
+description = "Terminal inventory and provisioning controller for self-hosted devices"
+readme = "README.md"
+requires-python = ">=3.11"
+dynamic = ["version", "dependencies"]
+
+[project.scripts]
+onboardrr = "onboardrr.__main__:entrypoint"
+
+[project.urls]
+Repository = "https://github.com/kinouzero/onboardrr"
+Releases = "https://github.com/kinouzero/onboardrr/releases"
+Issues = "https://github.com/kinouzero/onboardrr/issues"
+
+[project.optional-dependencies]
+test = ["coverage>=7.13,<8"]
+
+[tool.coverage.run]
+branch = true
+source = ["onboardrr"]
+patch = ["subprocess"]
+
+[tool.coverage.report]
+include_namespace_packages = true
+precision = 1
+
+[tool.hatch.version]
+path = "onboardrr/__init__.py"
+
+[tool.hatch.metadata.hooks.requirements_txt]
+files = ["requirements.txt"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["onboardrr"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"provisioning" = "onboardrr/provisioning"
+
+[tool.hatch.build.targets.sdist]
+include = ["/onboardrr", "/provisioning", "/distribution", "/requirements.txt", "/README.md"]

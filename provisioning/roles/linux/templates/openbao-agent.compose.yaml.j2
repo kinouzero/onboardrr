@@ -1,0 +1,51 @@
+name: secrets
+services:
+  openbao-agent-{{ onboardrr_agent_variant }}:
+{% if onboardrr_agent_variant == 'komodo' %}
+    cap_drop: [ALL]
+    entrypoint: ["/usr/bin/bao", "agent", "-config=/agent/agent.hcl"]
+{% else %}
+    command: [agent, -config=/agent/agent.hcl]
+{% endif %}
+    container_name: openbao-agent-{{ onboardrr_agent_variant }}
+    image: ghcr.io/openbao/openbao:2.7.3
+    labels:
+      docker.stack: secrets
+      homepage.href: ${URL_BAO}
+      homepage.group: Docker ${DOCKER_HOSTNAME}
+      homepage.icon: sh-openbao
+      homepage.name: openbao-agent-{{ onboardrr_agent_variant }}
+      komodo.skip:
+{% if onboardrr_name == 'zero' %}
+      kuma.__docker: '"${DOCKER_HOSTNAME}", "socket", "/var/run/docker.sock"'
+{% else %}
+      kuma.__docker: '"${DOCKER_HOSTNAME}", "tcp", "http://${HOST_IP}:${DOCKER_API_PORT}"'
+{% endif %}
+      wud.display.icon: sh-openbao
+      wud.display.name: openbao-agent-{{ onboardrr_agent_variant }}
+      wud.link.template: https://github.com/{{ 'openbao/openbao' if onboardrr_agent_variant == 'komodo' else 'moghtech/komodo' }}/releases
+      wud.tag.include: '^\d+\.\d+\.\d+$$'
+{% if onboardrr_openbao_internal_endpoint %}
+    networks: [openbao]
+{% elif onboardrr_agent_variant == 'compose' %}
+    network_mode: bridge
+{% endif %}
+    restart: always
+{% if onboardrr_agent_variant == 'komodo' %}
+    security_opt: [no-new-privileges:true]
+{% endif %}
+    user: "{{ onboardrr_account[1] }}:{{ onboardrr_account[2] }}"
+    volumes:
+      - type: bind
+        source: {{ (onboardrr_agent_directory ~ '/agent') | replace('$', '$$') | to_json }}
+        target: /agent
+        read_only: true
+      - type: bind
+        source: {{ (onboardrr_agent_directory ~ '/' ~ onboardrr_agent_output) | replace('$', '$$') | to_json }}
+        target: /{{ onboardrr_agent_output }}
+{% if onboardrr_openbao_internal_endpoint %}
+networks:
+  openbao:
+    external: true
+    name: {{ onboardrr_openbao_internal_endpoint.network | replace('$', '$$') | to_json }}
+{% endif %}

@@ -1,0 +1,14 @@
+---
+- name: Configure and install Docker CE and its plugins
+  ansible.builtin.include_tasks: vendor_apt.yml
+  vars:
+    onboardrr_vendor: docker
+    onboardrr_vendor_pattern: '(?m)^[^\S\n]*(?:deb(?:-src)?\s|URIs:\s)[^\n]*https?://download\.docker\.com/linux/'
+    onboardrr_docker_family: "{{ 'debian' if ansible_facts.distribution == 'Debian' else 'ubuntu' }}"
+    onboardrr_vendor_key_url: "https://download.docker.com/linux/{{ onboardrr_docker_family }}/gpg"
+    onboardrr_vendor_source: |
+      URIs: https://download.docker.com/linux/{{ onboardrr_docker_family }}
+      Suites: {{ 'trixie' if onboardrr_docker_family == 'debian' else 'noble' }}
+      Components: stable
+      Architectures: {{ 'amd64' if ansible_facts.architecture == 'x86_64' else 'arm64' }}
+    onboardrr_vendor_packages: [docker-ce, docker-ce-cli, containerd.io, docker-buildx-plugin, docker-compose-plugin]

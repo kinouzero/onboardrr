@@ -1,0 +1,14 @@
+services:
+  komodo:
+    command: ["/bin/bash", "/run/komodo-openbao/watch-core.sh"]
+    environment:
+      KOMODO_CONFIG_PATHS: /config,/run/komodo-openbao/rendered/core.config.toml
+    volumes:
+      - type: bind
+        source: {{ (onboardrr_openbao_directory ~ '/komodo/watch-core.sh') | replace('$', '$$') | to_json }}
+        target: /run/komodo-openbao/watch-core.sh
+        read_only: true
+      - type: bind
+        source: {{ (onboardrr_komodo_agent_directory ~ '/rendered') | replace('$', '$$') | to_json }}
+        target: /run/komodo-openbao/rendered
+        read_only: true

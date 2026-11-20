@@ -1,0 +1,50 @@
+---
+- name: Check the existing shell configuration
+  ansible.builtin.stat:
+    path: "{{ onboardrr_home }}/.bashrc"
+    follow: false
+  register: onboardrr_shell_config
+
+- name: Preserve shell configuration owned by another file or account
+  ansible.builtin.assert:
+    that:
+      - not onboardrr_shell_config.stat.exists or onboardrr_shell_config.stat.isreg
+      - not onboardrr_shell_config.stat.exists or onboardrr_shell_config.stat.uid == onboardrr_account[1] | int
+    fail_msg: The operator's shell configuration is not a regular file owned by the account.
+
+- name: Prepare a local Compose workspace when Goku mounts are skipped
+  ansible.builtin.file:
+    path: "{{ onboardrr_home }}/.docker/compose/{{ onboardrr_name }}"
+    state: directory
+    follow: false
+  become: false
+  remote_user: "{{ onboardrr_user }}"
+  when: onboardrr_system_only | default(false) | bool
+
+- name: Install the local Compose launcher
+  ansible.builtin.copy:
+    src: "{{ lookup('ansible.builtin.first_found', onboardrr_compose_launcher_sources) }}"
+    dest: /usr/local/bin/onboardrr-dcu
+    owner: root
+    group: root
+    mode: "0755"
+    follow: false
+  vars:
+    onboardrr_compose_launcher_sources:
+      - "{{ playbook_dir }}/../remote/compose_update.py"
+      - "{{ playbook_dir }}/../onboardrr/remote/compose_update.py"
+
+- name: Install the managed Bash aliases for the operator
+  ansible.builtin.blockinfile:
+    path: "{{ onboardrr_home }}/.bashrc"
+    marker: "# {mark} ONBOARDRR MANAGED BLOCK"
+    block: |
+      alias cdcompose='cd "$HOME/.docker/compose/{{ onboardrr_name }}"'
+      {% if onboardrr_profile | default('raspberry-pi') == 'server' %}
+      alias cdconfig='cd "$HOME/.config/docker"'
+      {% endif %}
+      alias dcu='/usr/local/bin/onboardrr-dcu'
+    backup: true
+    create: true
+  become: false
+  remote_user: "{{ onboardrr_user }}"

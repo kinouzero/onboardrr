@@ -1,0 +1,162 @@
+---
+- name: Configure and start the OpenBao Agent
+  become: false
+  remote_user: "{{ onboardrr_user }}"
+  vars:
+    onboardrr_agent_name: "openbao-agent-{{ onboardrr_agent_variant }}"
+    onboardrr_previous_agent_id: "{{ onboardrr_previous_project_agent.stdout.split() | first | default('') }}"
+    onboardrr_previous_agent_archived: "{{ onboardrr_previous_project_agent.stdout.endswith(' ' ~ onboardrr_agent_name ~ '-previous') }}"
+  block:
+    - name: Create private OpenBao Agent directories
+      ansible.builtin.file:
+        path: "{{ onboardrr_agent_directory }}/{{ item }}"
+        state: directory
+        mode: "0700"
+        follow: false
+      loop: ["", agent, "{{ onboardrr_agent_output }}"]
+
+    - name: Write the OpenBao Agent configuration and AppRole credentials
+      ansible.builtin.copy:
+        dest: "{{ onboardrr_agent_directory }}/agent/{{ item.name }}"
+        content: "{{ item.content }}"
+        mode: "0400"
+        follow: false
+      loop:
+        - name: agent.hcl
+          content: >-
+            {{ ((onboardrr_agent_credentials.config_b64 | b64decode | from_json)
+                 | combine({'vault': {'address': onboardrr_openbao_internal_endpoint.address}}, recursive=true)
+                 | to_nice_json(indent=2))
+               if onboardrr_openbao_internal_endpoint else onboardrr_agent_credentials.config_b64 | b64decode }}
+        - name: role-id
+          content: "{{ onboardrr_agent_credentials.role_id }}\n"
+        - name: secret-id
+          content: "{{ onboardrr_agent_credentials.secret_id }}\n"
+      register: onboardrr_agent_configuration
+      no_log: true
+
+    - name: Install the host-specific OpenBao Agent Compose
+      ansible.builtin.template:
+        src: openbao-agent.compose.yaml.j2
+        dest: "{{ onboardrr_agent_directory }}/compose.yaml"
+        mode: "0600"
+        follow: false
+
+    - name: Find the same agent under its previous project name
+      ansible.builtin.command:
+        argv:
+          - docker
+          - --host
+          - unix:///var/run/docker.sock
+          - ps
+          - --all
+          - --no-trunc
+          - --format
+          - "{% raw %}{{.ID}} {{.Names}}{% endraw %}"
+          - --filter
+          - "name=^/{{ onboardrr_agent_name }}(-previous)?$"
+          - --filter
+          - "label=com.docker.compose.project={{ onboardrr_agent_previous_project }}"
+          - --filter
+          - "label=com.docker.compose.service={{ onboardrr_agent_name }}"
+      register: onboardrr_previous_project_agent
+      changed_when: false
+      failed_when: onboardrr_previous_project_agent.rc != 0 or onboardrr_previous_project_agent.stdout_lines | length > 1
+
+    - name: Move the agent to the secrets project
+      block:
+        - name: Move the old agent name aside
+          ansible.builtin.command:
+            argv: [docker, --host, "unix:///var/run/docker.sock", rename, "{{ onboardrr_previous_agent_id }}", "{{ onboardrr_agent_name }}-previous"]
+          register: onboardrr_previous_project_rename
+          when: onboardrr_previous_agent_id != '' and not onboardrr_previous_agent_archived
+
+        - name: Stop the old agent before starting its replacement
+          ansible.builtin.command:
+            argv: [docker, --host, "unix:///var/run/docker.sock", stop, "{{ onboardrr_previous_agent_id }}"]
+          when: onboardrr_previous_agent_archived or onboardrr_previous_project_rename is changed
+
+        - name: Start or refresh the OpenBao Agent
+          ansible.builtin.command:
+            argv: "{{ ['env', '-u', 'URL_BAO', '-u', 'DOCKER_HOSTNAME', '-u', 'HOST_IP', '-u', 'DOCKER_API_PORT',
+                       'docker', '--host', 'unix:///var/run/docker.sock', 'compose', '--ansi', 'never',
+                       '--project-name', 'secrets',
+                       '--env-file', onboardrr_openbao_directory ~ '/compose.env',
+                       '--file', onboardrr_agent_directory ~ '/compose.yaml', 'up', '--no-deps', '--wait', '--wait-timeout', '45']
+                       + (['--force-recreate'] if onboardrr_agent_configuration.changed else []) + [onboardrr_agent_name] }}"
+          environment:
+            COMPOSE_REMOVE_ORPHANS: "false"
+          register: onboardrr_agent_container
+          changed_when: onboardrr_agent_container.stderr is search('Started|Created|Recreated')
+
+        - name: Wait for OpenBao Agent to render its files
+          ansible.builtin.wait_for:
+            path: "{{ onboardrr_agent_directory }}/{{ onboardrr_agent_output }}/{{ item }}"
+            state: present
+            timeout: 90
+          loop: "{{ onboardrr_agent_files }}"
+
+        - name: Check permissions on rendered files
+          ansible.builtin.stat:
+            path: "{{ onboardrr_agent_directory }}/{{ onboardrr_agent_output }}/{{ item }}"
+            follow: false
+            get_checksum: false
+            get_mime: false
+            get_attributes: false
+          loop: "{{ onboardrr_agent_files }}"
+          register: onboardrr_agent_rendered
+
+        - name: Verify that rendered files are private
+          ansible.builtin.assert:
+            that:
+              - item.stat.isreg | default(false)
+              - item.stat.uid == onboardrr_account[1] | int
+              - item.stat.mode == '0600'
+              - item.stat.size > 0
+            quiet: true
+          loop: "{{ onboardrr_agent_rendered.results }}"
+          loop_control:
+            label: "{{ item.item }}"
+      rescue:
+        - name: Restore the previous agent if the migration failed
+          when: onboardrr_previous_agent_archived or onboardrr_previous_project_rename is changed
+          block:
+            - name: Find the replacement created by the secrets project
+              ansible.builtin.command:
+                argv:
+                  - docker
+                  - --host
+                  - unix:///var/run/docker.sock
+                  - ps
+                  - --all
+                  - --quiet
+                  - --filter
+                  - "name=^/{{ onboardrr_agent_name }}$"
+                  - --filter
+                  - label=com.docker.compose.project=secrets
+                  - --filter
+                  - "label=com.docker.compose.service={{ onboardrr_agent_name }}"
+              register: onboardrr_failed_agent_replacement
+              changed_when: false
+
+            - name: Remove the failed replacement
+              ansible.builtin.command:
+                argv: [docker, --host, "unix:///var/run/docker.sock", rm, --force, "{{ onboardrr_failed_agent_replacement.stdout }}"]
+              when: onboardrr_failed_agent_replacement.stdout != ''
+
+            - name: Restore the previous container name
+              ansible.builtin.command:
+                argv: [docker, --host, "unix:///var/run/docker.sock", rename, "{{ onboardrr_previous_agent_id }}", "{{ onboardrr_agent_name }}"]
+
+            - name: Restart the previous agent
+              ansible.builtin.command:
+                argv: [docker, --host, "unix:///var/run/docker.sock", start, "{{ onboardrr_previous_agent_id }}"]
+
+        - name: Report the failed agent deployment
+          ansible.builtin.fail:
+            msg: "Could not deploy {{ onboardrr_agent_name }} under the secrets project ({{ ansible_failed_task.name }})."
+
+    - name: Remove the previous container after verifying the replacement
+      ansible.builtin.command:
+        argv: [docker, --host, "unix:///var/run/docker.sock", rm, "{{ onboardrr_previous_agent_id }}"]
+      when: onboardrr_previous_agent_archived or onboardrr_previous_project_rename is changed

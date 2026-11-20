@@ -1,0 +1,153 @@
+---
+- name: Inspect active mount and its persistent entry
+  ansible.builtin.command:
+    argv: "{{ ['findmnt', '--mountpoint', onboardrr_mount.path, '--noheadings', '--raw', '--output', 'SOURCE,FSTYPE'] + item }}"
+  loop:
+    - []
+    - [--fstab]
+  register: onboardrr_mount_state
+  changed_when: false
+  failed_when: onboardrr_mount_state.rc not in [0, 1]
+  check_mode: false
+
+- name: Preserve existing entries configured for a different source
+  ansible.builtin.assert:
+    that:
+      - >-
+        item.rc == 1 or item.stdout.strip() == onboardrr_mount.source ~ ' ' ~ onboardrr_mount.fstype or
+        (item.cmd[-1] != '--fstab' and item.stdout.strip() ==
+         (onboardrr_mount.active_source | default(onboardrr_mount.source)) ~ ' ' ~ onboardrr_mount.fstype)
+    fail_msg: "{{ onboardrr_mount.path }} has a conflicting mount or fstab entry."
+  loop: "{{ onboardrr_mount_state.results }}"
+  loop_control:
+    label: "{{ item.cmd[-1] }}"
+
+- name: Inspect the destination before mounting
+  ansible.builtin.stat:
+    path: "{{ onboardrr_mount.path }}"
+    follow: false
+  register: onboardrr_mount_target
+  when: onboardrr_mount_state.results[0].rc == 1
+
+- name: Require a real directory when the mount point already exists
+  ansible.builtin.assert:
+    that: onboardrr_mount_target.stat.isdir
+    fail_msg: "{{ onboardrr_mount.path }} must be a real mount directory."
+  when:
+    - onboardrr_mount_state.results[0].rc == 1
+    - onboardrr_mount_target.stat.exists
+
+- name: Remove an empty local Compose workspace left by system-only preparation
+  when:
+    - onboardrr_mount_state.results[0].rc == 1
+    - onboardrr_mount.local_workspace is defined
+    - onboardrr_mount_target.stat.exists
+  block:
+    - name: Identify the operator's local workspace directory
+      ansible.builtin.stat:
+        path: "{{ onboardrr_mount.local_workspace }}"
+        follow: false
+      register: onboardrr_local_workspace
+
+    - name: Check the Compose directory for local data outside the workspace
+      ansible.builtin.command:
+        argv: [find, "{{ onboardrr_mount.path }}", -mindepth, '1', -maxdepth, '1',
+               '!', -name, "{{ onboardrr_name }}", -print, -quit]
+      register: onboardrr_other_compose_entries
+      changed_when: false
+      check_mode: false
+
+    - name: Check and remove the empty workspace
+      when:
+        - onboardrr_local_workspace.stat.isdir | default(false)
+        - onboardrr_local_workspace.stat.uid == onboardrr_account[1] | int
+        - not onboardrr_other_compose_entries.stdout
+      block:
+        - name: Check the workspace for local data
+          ansible.builtin.command:
+            argv: [find, "{{ onboardrr_mount.local_workspace }}", -mindepth, '1', -maxdepth, '1', -print, -quit]
+          register: onboardrr_workspace_entries
+          changed_when: false
+          check_mode: false
+
+        - name: Confirm the workspace is empty
+          ansible.builtin.assert:
+            that: not onboardrr_workspace_entries.stdout
+            fail_msg: "{{ onboardrr_mount.local_workspace }} contains local data. Move or back up the files before mounting Goku."
+
+        - name: Remove only the empty workspace directory
+          ansible.builtin.command:
+            argv: [rmdir, --, "{{ onboardrr_mount.local_workspace }}"]
+          become: false
+          remote_user: "{{ onboardrr_user }}"
+          changed_when: true
+          when: not ansible_check_mode
+
+- name: Check the unmounted directory for existing local entries
+  ansible.builtin.command:
+    argv: "{{ ['find', onboardrr_mount.path, '-mindepth', '1', '-maxdepth', '1']
+              + (['!', '-name', onboardrr_name] if onboardrr_skip_empty_workspace else [])
+              + ['-print', '-quit'] }}"
+  vars:
+    onboardrr_skip_empty_workspace: >-
+      {{ ansible_check_mode and onboardrr_mount.local_workspace is defined
+         and onboardrr_local_workspace.stat.isdir | default(false)
+         and onboardrr_local_workspace.stat.uid == onboardrr_account[1] | int
+         and onboardrr_workspace_entries.stdout is defined
+         and not onboardrr_workspace_entries.stdout
+         and not onboardrr_other_compose_entries.stdout }}
+  register: onboardrr_local_entries
+  changed_when: false
+  check_mode: false
+  when:
+    - onboardrr_mount_state.results[0].rc == 1
+    - onboardrr_mount_target.stat.exists
+
+- name: Refuse to hide local entries under a mount
+  ansible.builtin.assert:
+    that: not onboardrr_local_entries.stdout
+    fail_msg: "{{ onboardrr_mount.path }} contains local data while the Goku share is unmounted."
+  when:
+    - onboardrr_mount_state.results[0].rc == 1
+    - onboardrr_mount_target.stat.exists
+
+- name: Create a missing mount directory
+  ansible.builtin.file:
+    path: "{{ onboardrr_mount.path }}"
+    state: directory
+    mode: "0755"
+  when:
+    - onboardrr_mount_state.results[0].rc == 1
+    - not onboardrr_mount_target.stat.exists
+
+- name: Store a new fstab entry with a backup
+  ansible.posix.mount:
+    path: "{{ onboardrr_mount.path }}"
+    src: "{{ onboardrr_mount.source }}"
+    fstype: "{{ onboardrr_mount.fstype }}"
+    opts: "{{ onboardrr_mount.options }}"
+    dump: '0'
+    passno: '0'
+    backup: true
+    state: present
+  when: onboardrr_mount_state.results[1].rc == 1
+
+- name: Activate an unmounted entry using fstab options
+  ansible.builtin.command:
+    argv: [mount, --, "{{ onboardrr_mount.path }}"]
+  changed_when: true
+  when:
+    - onboardrr_mount_state.results[0].rc == 1
+    - not ansible_check_mode
+
+- name: Verify the active mount source
+  ansible.builtin.command:
+    argv: [findmnt, --mountpoint, "{{ onboardrr_mount.path }}", --noheadings, --raw, --output, "SOURCE,FSTYPE"]
+  register: onboardrr_verified_mount
+  changed_when: false
+  failed_when: >-
+    onboardrr_verified_mount.rc != 0 or
+    onboardrr_verified_mount.stdout.strip() not in
+    [onboardrr_mount.source ~ ' ' ~ onboardrr_mount.fstype,
+     (onboardrr_mount.active_source | default(onboardrr_mount.source)) ~ ' ' ~ onboardrr_mount.fstype]
+  when: not ansible_check_mode

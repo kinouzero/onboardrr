@@ -1,0 +1,6 @@
+---
+onboardrr_docker_api_port: 2380
+onboardrr_openbao_internal_endpoints:
+  zero:
+    network: zero
+    address: http://openbao:8200

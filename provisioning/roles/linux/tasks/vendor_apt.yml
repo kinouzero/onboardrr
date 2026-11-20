@@ -1,0 +1,62 @@
+---
+- name: Check for other configuration for the vendor's APT repository
+  ansible.builtin.find:
+    paths: [/etc/apt, /etc/apt/sources.list.d]
+    patterns: [sources.list, '*.list', '*.sources']
+    excludes: "onboardrr-{{ onboardrr_vendor }}.sources"
+    contains: "{{ onboardrr_vendor_pattern }}"
+    read_whole_file: true
+    follow: true
+  register: onboardrr_existing_vendor_sources
+
+- name: Require a single source for the vendor's packages
+  ansible.builtin.assert:
+    that: onboardrr_existing_vendor_sources.matched == 0
+    fail_msg: Review the existing {{ onboardrr_vendor }} APT source before provisioning the vendor packages.
+
+- name: Ensure the APT keyring directory exists
+  ansible.builtin.file:
+    path: /etc/apt/keyrings
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Download the vendor signing key
+  ansible.builtin.get_url:
+    url: "{{ onboardrr_vendor_key_url }}"
+    dest: "/etc/apt/keyrings/onboardrr-{{ onboardrr_vendor }}.asc"
+    owner: root
+    group: root
+    mode: "0644"
+    force: false
+  register: onboardrr_vendor_key
+  when: not ansible_check_mode
+
+- name: Configure the vendor's signed APT source
+  ansible.builtin.copy:
+    content: |
+      Types: deb
+      {{ onboardrr_vendor_source | trim }}
+      Signed-By: /etc/apt/keyrings/onboardrr-{{ onboardrr_vendor }}.asc
+    dest: "/etc/apt/sources.list.d/onboardrr-{{ onboardrr_vendor }}.sources"
+    owner: root
+    group: root
+    mode: "0644"
+    backup: true
+  register: onboardrr_vendor_repo
+
+- name: Preview packages that depend on a new APT source
+  ansible.builtin.debug:
+    msg: "Will install {{ onboardrr_vendor_packages | join(', ') }} after configuring the signed {{ onboardrr_vendor }} APT source."
+  when: ansible_check_mode and onboardrr_vendor_repo.changed
+
+- name: Install vendor packages without removing existing packages
+  ansible.builtin.apt:
+    name: "{{ onboardrr_vendor_packages }}"
+    state: present
+    update_cache: "{{ not ansible_check_mode }}"
+    cache_valid_time: "{{ 0 if onboardrr_vendor_repo.changed or onboardrr_vendor_key.changed else 3600 }}"
+    force_apt_get: true
+    fail_on_autoremove: true
+  when: not ansible_check_mode or not onboardrr_vendor_repo.changed

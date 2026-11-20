@@ -1,0 +1,86 @@
+---
+- name: Install BlueZ and rfkill
+  ansible.builtin.apt:
+    name: [bluez, rfkill]
+    state: present
+    fail_on_autoremove: true
+
+- name: Activate Bluetooth on the provisioned host
+  when: not ansible_check_mode
+  block:
+    - name: Check whether the kernel exposes rfkill
+      ansible.builtin.stat:
+        path: /dev/rfkill
+      register: onboardrr_rfkill_device
+
+    - name: Read Bluetooth radio block states
+      ansible.builtin.command:
+        argv: [rfkill, --noheadings, --output, "SOFT,HARD", list, bluetooth]
+      environment:
+        LC_ALL: C
+      register: onboardrr_bluetooth_blocks
+      changed_when: false
+      when: onboardrr_rfkill_device.stat.exists
+
+    - name: Clear Bluetooth software blocks
+      ansible.builtin.command:
+        argv: [rfkill, unblock, bluetooth]
+      changed_when: true
+      when: onboardrr_bluetooth_blocks.stdout | default('') is search('(?m)^\s*blocked\s+')
+
+    - name: Check for the kernel Bluetooth class
+      ansible.builtin.stat:
+        path: /sys/class/bluetooth
+      register: onboardrr_bluetooth_class
+
+    - name: Find Bluetooth adapters reported by the kernel
+      ansible.builtin.find:
+        paths: /sys/class/bluetooth
+        file_type: any
+        use_regex: true
+        patterns: '^hci[0-9]+$'
+        recurse: false
+      register: onboardrr_bluetooth_adapters
+      when: onboardrr_bluetooth_class.stat.isdir | default(false)
+
+    - name: Enable BlueZ and start it when an adapter is present
+      ansible.builtin.systemd_service:
+        name: bluetooth.service
+        enabled: true
+        masked: false
+        state: "{{ 'started' if onboardrr_bluetooth_adapters.matched | default(0) > 0 else omit }}"
+
+    - name: Read the powered state of each Bluetooth adapter
+      ansible.builtin.command:
+        argv: [busctl, --system, --timeout=5s, get-property, org.bluez,
+               "/org/bluez/{{ item.path | basename }}", org.bluez.Adapter1, Powered]
+      loop: "{{ onboardrr_bluetooth_adapters.files | default([]) }}"
+      loop_control:
+        label: "{{ item.path | basename }}"
+      register: onboardrr_bluetooth_power_state
+      changed_when: false
+      failed_when: false
+
+    - name: Power on Bluetooth adapters that are off
+      ansible.builtin.command:
+        argv: [busctl, --system, --timeout=5s, set-property, org.bluez,
+               "/org/bluez/{{ item.item.path | basename }}", org.bluez.Adapter1, Powered, b, 'true']
+      loop: "{{ onboardrr_bluetooth_power_state.results }}"
+      loop_control:
+        label: "{{ item.item.path | basename }}"
+      when: item.rc == 0 and item.stdout == 'b false'
+      register: onboardrr_bluetooth_power_on
+      changed_when: onboardrr_bluetooth_power_on.rc == 0
+      failed_when: false
+
+    - name: Report when no Bluetooth adapter is present
+      ansible.builtin.debug:
+        msg: BlueZ is enabled. No Bluetooth adapter was detected by the kernel.
+      when: onboardrr_bluetooth_adapters.matched | default(0) == 0
+
+    - name: Report Bluetooth adapters that could not be powered
+      ansible.builtin.debug:
+        msg: At least one Bluetooth adapter could not be powered on. Check its hardware block, driver, or firmware.
+      when: >-
+        (onboardrr_bluetooth_power_state.results + onboardrr_bluetooth_power_on.results)
+        | selectattr('rc', 'defined') | rejectattr('rc', 'equalto', 0) | list | length > 0
