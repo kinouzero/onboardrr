@@ -53,25 +53,24 @@ class NasControllerTest(unittest.TestCase):
                          ["inspect", "inspect", "install-entware", "install-python", "apply", "docker-login"])
         self.assertEqual(call.call_args.kwargs["payload"], b"fixture-token\n")
 
-    def test_secondary_mount_checks_sudo_and_passes_openbao_credentials_in_the_payload(self):
-        secret = Mock()
-        secret.read.return_value = ("smb-user", "fixture-smb")
+    def test_secondary_mount_checks_sudo_and_configures_nfs_without_smb_credentials(self):
         cifs, nfs = self.endpoint.mount_sources("luffy")
         with (patch("onboardrr.nas.run", side_effect=[
                   {"uid": "1000", "gid": "100", "home": "/homes/operator"}, {"ready": "yes"},
               ]) as call,
               patch("onboardrr.nas.ssh.sudo_access", side_effect=["unavailable", "password"]) as sudo,
-              patch("onboardrr.secrets.configured_openbao", return_value=secret),
+              patch("onboardrr.secrets.configured_openbao") as bao,
               patch("onboardrr.goku_export.ensure_goku_export") as export):
             result = nas.prepare_storage(self.database, self.device, None, None, self.endpoint, cifs, nfs,
                                          apply=True, password_provider=self.storage_password)
-        self.assertEqual((result["compose"], result["periphery"]), (cifs, nfs))
+        self.assertEqual((result["compose"], result["periphery"]), ("local", nfs))
         self.assertEqual([item.args[2] for item in sudo.call_args_list], [None, "fixture-sudo"])
         export.assert_called_once_with(self.endpoint, "luffy", "192.168.1.30")
         self.assertEqual(call.call_args.args, (self.client, "compose-mount"))
         payload = json.loads(call.call_args.kwargs["payload"])
-        self.assertEqual(payload["config"]["password"], "fixture-smb")
-        self.assertNotIn("fixture-smb", str(call.call_args.kwargs["arguments"]))
+        self.assertEqual(payload["config"]["nfs"], nfs)
+        self.assertFalse(payload["config"].keys() & {"cifs", "username", "password"})
+        bao.assert_not_called()
 
     def test_primary_and_storage_preview_require_no_smb_access(self):
         for name, apply, expected in (("luffy", False, None), ("goku", True, "compose-local")):
@@ -247,10 +246,13 @@ class NasTest(unittest.TestCase):
             with (patch.object(Path, "home", return_value=home),
                   patch.object(nas_openbao, "docker", side_effect=docker)):
                 self.assertEqual(nas_openbao.install(request)["status"], "ready")
-                compose = json.loads((root / "compose.yaml").read_text())
+                compose = json.loads((home / ".docker/compose/compose.openbao.yml").read_text())
                 self.assertEqual(compose["name"], "secrets")
                 service = compose["services"]["openbao-agent-compose"]
                 self.assertEqual(service["labels"]["docker.stack"], "secrets")
+                self.assertEqual(service["labels"]["homepage.href"], "https://bao.example")
+                self.assertEqual(service["labels"]["homepage.group"], "Docker nas")
+                self.assertEqual(service["labels"]["kuma.__docker"], '"nas", "tcp", "http://192.0.2.12:2380"')
                 self.assertEqual(service["volumes"][1]["source"], str(root / "compose/cache"))
                 self.assertIn("DOCKER_API_PORT=2380", (root / "compose.env").read_text())
                 self.assertEqual((root / "compose/agent/secret-id").stat().st_mode & 0o777, 0o600)
@@ -258,6 +260,10 @@ class NasTest(unittest.TestCase):
                 calls.clear()
                 self.assertEqual(nas_openbao.install(request)["status"], "ready")
                 self.assertNotIn("--force-recreate", next(args for args in calls if "up" in args))
+                self.assertEqual(nas_openbao.install({**request, "kuma_local": True})["status"], "ready")
+                labels = json.loads((home / ".docker/compose/compose.openbao.yml").read_text())["services"][
+                    "openbao-agent-compose"]["labels"]
+                self.assertEqual(labels["kuma.__docker"], '"nas", "socket", "/var/run/docker.sock"')
 
     def test_openbao_migrates_only_the_recognized_legacy_agent_and_restores_it_on_failure(self):
         name = "openbao-agent-compose"
@@ -319,9 +325,10 @@ class NasTest(unittest.TestCase):
                     if scenario == "migration":
                         self.assertTrue(nas_openbao.install(request)["migrated"])
                         self.assertEqual(len(starts), 1)
-                        service = json.loads((root / "compose.yaml").read_text())["services"][name]
+                        manifest = home / ".docker/compose/compose.openbao.yml"
+                        service = json.loads(manifest.read_text())["services"][name]
                         self.assertEqual(service["volumes"][1]["source"], str(cache.parent))
-                        self.assertIn(str(root / "compose.yaml"), starts[0])
+                        self.assertIn(str(manifest), starts[0])
                         self.assertEqual(starts[0][-1], name)
                     elif scenario == "failed-render":
                         with self.assertRaisesRegex(ValueError, "previous agent was restored"):

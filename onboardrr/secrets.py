@@ -7,6 +7,7 @@ from ipaddress import IPv4Address
 from pathlib import Path
 
 from .http_json import HttpStatusError, JsonService
+from .inventory import HOST_LABEL
 
 
 PATH_SEGMENT = re.compile(r"[A-Za-z0-9_-]+")
@@ -51,17 +52,17 @@ def deployment_kv_path(mount, path, *, metadata=False, layout="legacy"):
     return f"{mount}/{operation}/{path}"
 
 
-def token_file(path):
+def token_file(path, *, service="OpenBao"):
     with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), "rb") as stream:
         info = os.fstat(stream.fileno())
         if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
-            raise ValueError("The OpenBao token must be a private file owned by the controller account.")
+            raise ValueError(f"The {service} token must be a private file owned by the controller account.")
         content = stream.read(8193)
     if len(content) > 8192:
-        raise ValueError("The OpenBao token file is too large.")
+        raise ValueError(f"The {service} token file is too large.")
     token = content.decode("ascii").strip()
     if not token or not token.isascii() or any(not 33 <= ord(character) <= 126 for character in token):
-        raise ValueError("The OpenBao token file does not contain a valid token.")
+        raise ValueError(f"The {service} token file does not contain a valid token.")
     return token
 
 
@@ -169,20 +170,51 @@ def configured_newt_openbao():
     return OpenBao(url, mount, token_file(Path(token_path).expanduser()))
 
 
-def stored_host_ipv4(name):
+def stored_host_ipv4(name, *, nas_client=False):
     bao = configured_openbao(mount="hosts")
     if bao is None:
         return None
+    keys = ("value", "nas_client_ipv4") if nas_client else ("value",)
     try:
-        fields, _ = bao.fields_with_version(f"{name}/IP", "value")
+        fields, _ = bao.fields_with_version(f"{name}/IP", *keys)
     except HttpStatusError as error:
         if error.status == 404:
             return None
         raise
-    value = fields.get("value")
+    value = fields.get("nas_client_ipv4", fields.get("value")) if nas_client else fields.get("value")
     if not isinstance(value, str):
         raise ValueError(f"Set hosts/{name}/IP to the host's IPv4 address.")
     return str(IPv4Address(value))
+
+
+def publish_host_ipv4(bao, name, ipv4, *, nas_client=None):
+    if not HOST_LABEL.fullmatch(name):
+        raise ValueError("The device name must be a DNS label.")
+    address = str(IPv4Address(ipv4))
+    desired = {"value": address}
+    if nas_client is not None:
+        desired["nas_client_ipv4"] = str(IPv4Address(nas_client))
+    path = f"{name}/IP"
+    for attempt in range(3):
+        try:
+            try:
+                fields, version = bao.fields_with_version(path, *desired)
+            except HttpStatusError as error:
+                if error.status != 404:
+                    raise
+                bao.create(path, desired)
+            else:
+                if fields == desired:
+                    return
+                bao.patch(path, desired, version=version)
+            if bao.read(path, *desired) == tuple(desired.values()):
+                return
+        except HttpStatusError as error:
+            if error.status == 403:
+                raise ValueError(f"Grant the controller read, create and patch access to hosts/data/{path}.") from None
+            if error.status not in (400, 409) or attempt == 2:
+                raise
+    raise ValueError(f"OpenBao did not confirm hosts/{path}.")
 
 
 def integration_credentials(name, *, optional=False):

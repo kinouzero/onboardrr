@@ -127,6 +127,24 @@ MIGRATIONS = (
            ipv4 TEXT NOT NULL
         )""",
     ),
+    (
+        """CREATE TABLE host_ip_stack_deployments (
+           device_id TEXT PRIMARY KEY REFERENCES devices(id) ON DELETE CASCADE,
+           ipv4 TEXT NOT NULL,
+           completed TEXT NOT NULL
+        )""",
+    ),
+    (
+        """CREATE TABLE portabase_dashboard_sources (
+           device_id TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+           origin TEXT NOT NULL,
+           agent_id TEXT NOT NULL,
+           source TEXT NOT NULL,
+           generated_id TEXT NOT NULL,
+           name TEXT NOT NULL,
+           PRIMARY KEY (device_id, origin, agent_id, source)
+        )""",
+    ),
 )
 
 

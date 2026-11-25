@@ -66,6 +66,10 @@ path "services/data/termix/onboardrr" {
   capabilities = ["read"]
 }
 
+path "services/data/portabase/onboardrr" {
+  capabilities = ["read"]
+}
+
 path "services/data/wud/PASSWORD" {
   capabilities = ["read"]
 }
@@ -75,7 +79,7 @@ path "hosts/data/+/HOSTNAME" {
 }
 
 path "hosts/data/+/IP" {
-  capabilities = ["read", "create"]
+  capabilities = ["read", "create", "patch"]
 }
 
 path "hosts/data/+/HOST_IP" {

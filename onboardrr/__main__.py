@@ -2,12 +2,13 @@
 
 import argparse
 import getpass
+import io
 import json
 import logging
 import os
 import sqlite3
 import sys
-from contextlib import ExitStack
+from contextlib import ExitStack, redirect_stdout
 from pathlib import Path
 
 from . import __version__
@@ -34,12 +35,14 @@ from .runs import RunStore
 from .runtime import load_controller_settings
 from .secrets import configured_newt_openbao, configured_openbao, deployment_openbao, integration_credentials, token_file
 from .stack_update import manage_compose_files, update_stack
-from .stacks import BASELINE, apply_baseline, preview_baseline
+from .stack_ip_refresh import dependent_stacks, refresh_komodo_host_ip
+from .storage_ip_sync import sync_storage_ip
+from .stacks import BASELINE, apply_baseline, host_ip_variable, preview_baseline
 from .ssh_retirement import retire_key
 from .sudo_input import SudoInput, read_password
 from .usb_storage import configure as configure_usb_storage
 from .verification import verify_run
-from .wifi import BANDS, WIFI_SECRETS, configure_wifi
+from .wifi import BANDS, WIFI_SECRETS, configure_wifi, disable_wifi, sync_host_network
 
 
 def ssh_module():
@@ -396,10 +399,9 @@ def prepare_command(args, inventory, database):
 
     system_only = args.system_only or component not in (None, "goku-mounts")
     if args.system_only and component == "goku-mounts":
-        raise ValueError("Goku mounts require the SMB and NFS sources.")
+        raise ValueError("Periphery storage requires an NFS source.")
     optional_mounts = {
-        "dev": args.dev_source, "scripts": args.scripts_source,
-        "downloads": args.downloads_source, "plex": args.plex_source,
+        "dev": args.dev_source, "downloads": args.downloads_source, "plex": args.plex_source,
     }
     server_options = {
         "inotify_instances": args.inotify_instances,
@@ -433,6 +435,7 @@ def prepare_command(args, inventory, database):
             return record(nas.prepare_openbao(
                 database, device, args.known_hosts.expanduser(), args.public_key.expanduser(),
                 apply=args.apply, ensure=args.ensure_openbao_agent,
+                require_core=args.require_komodo_agent, render_project=args.render_project,
             ))
         monitoring = None
         if component is None and not args.skip_monitoring and os.environ.get("ONBOARDRR_MONITORING_HOST"):
@@ -454,16 +457,18 @@ def prepare_command(args, inventory, database):
         endpoint = storage_endpoint(database)
         if endpoint.user:
             args.cifs_source, args.nfs_source = endpoint.mount_sources(device["name"], args.cifs_source, args.nfs_source)
-        if not args.cifs_source or not args.nfs_source:
-            raise ValueError("Provide both --cifs-source and --nfs-source, or use --system-only.")
-        bao = configured_openbao()
-        if bao is None:
-            raise ValueError("Configure OpenBao to supply the Goku deployment credentials.")
+        if not args.nfs_source:
+            raise ValueError("Provide --nfs-source for Periphery storage, or use --system-only.")
+        if any(optional_mounts.values()):
+            bao = configured_openbao()
+            if bao is None:
+                raise ValueError("Configure OpenBao to supply credentials for the optional SMB shares.")
     if args.ensure_openbao_agent and not args.apply:
         raise ValueError("Use --ensure-openbao-agent with --apply to create missing credentials.")
     agent = None
     if not args.skip_openbao_agent and component in (None, "openbao-agent"):
-        agent = configured_compose_agent(device["name"], ensure=args.ensure_openbao_agent)
+        agent = configured_compose_agent(device["name"], ensure=args.ensure_openbao_agent,
+                                         require_core=args.require_komodo_agent, render_project=args.render_project)
     return record(prepare_linux(
         device, args.known_hosts.expanduser(), args.cifs_source, args.nfs_source, bao,
         check=not args.apply, allow_reboot=args.allow_reboot, become_password=sudo_password(args),
@@ -472,6 +477,31 @@ def prepare_command(args, inventory, database):
         **({"component": component} if component else {}), **server_options,
         **({"storage_name": endpoint.name} if not system_only and endpoint.user else {}),
     ))
+
+
+def platform_stack_command(args, inventory, database):
+    from .platform_stacks import install_stack
+
+    device = inventory.get(args.device)
+
+    def prepare_agent():
+        arguments = ["--database", str(database), "prepare", args.device, "--component", "openbao-agent",
+                     "--known-hosts", str(args.known_hosts), "--ensure-openbao-agent", "--apply",
+                     "--render-project", args.stack]
+        if device["profile"] == NAS_PROFILE:
+            arguments.extend(("--public-key", str(args.public_key)))
+        if args.ask_become_pass:
+            arguments.append("--ask-become-pass")
+        if args.stack == "komodo":
+            arguments.append("--require-komodo-agent")
+        with redirect_stdout(io.StringIO()) as output:
+            status = main(arguments, sudo_input=args.sudo_input)
+        report = json.loads(output.getvalue()) if output.getvalue() else {}
+        if status or report.get("blockers"):
+            raise ValueError(" ".join(report.get("blockers") or ["The required OpenBao Agent could not be prepared."]))
+
+    return install_stack(database, device, args.stack, args.public_key, args.known_hosts.expanduser(),
+                         apply=args.apply, prepare_agent=prepare_agent)
 
 
 def sudo_password(args):
@@ -484,6 +514,30 @@ def wifi_command(args, inventory):
     device = inventory.get(args.device)
     if device["profile"] != PROFILE:
         raise ValueError("The Wi-Fi bootstrap is available for the Raspberry Pi profile.")
+    host_bao = configured_openbao(mount="hosts") if args.apply else None
+    redeploy = None
+    if host_bao is not None and os.environ.get("ONBOARDRR_KOMODO_URL"):
+        def redeploy(host, address):
+            return refresh_komodo_host_ip(komodo_client(), inventory, host, args.known_hosts.expanduser(), address)
+    if args.sync:
+        def storage_sync(host, address, *, apply):
+            return sync_storage_ip(inventory.database, host, args.known_hosts.expanduser(), address, apply=apply)
+
+        result = sync_host_network(device, args.known_hosts.expanduser(), args.interface, apply=args.apply,
+                                   host_bao=host_bao, database=inventory.database, redeploy=redeploy,
+                                   storage_sync=storage_sync)
+        if not args.apply and not result.get("blockers") and os.environ.get("ONBOARDRR_KOMODO_URL"):
+            api = komodo_client()
+            result.update(api.sync_periphery_ip(device["name"], result["ipv4"], apply=False))
+            result["komodo_stacks"] = [
+                {"name": name, "state": state}
+                for _, name, state in dependent_stacks(api, host_ip_variable(device["name"]))
+            ]
+        return result
+    if args.disable:
+        return disable_wifi(device, args.known_hosts.expanduser(), apply=args.apply,
+                            become_password=sudo_password(args), host_bao=host_bao, database=inventory.database,
+                            redeploy=redeploy)
     credentials = None
     if args.apply:
         bao = configured_openbao()
@@ -507,6 +561,7 @@ def wifi_command(args, inventory):
     return configure_wifi(
         device, args.known_hosts.expanduser(), args.interface,
         credentials=credentials, become_password=sudo_password(args), band=args.band,
+        host_bao=host_bao, database=inventory.database, redeploy=redeploy,
     )
 
 
@@ -536,9 +591,21 @@ def main(argv=None, *, sudo_input=None):
     storage.add_argument("device", metavar="DEVICE")
     storage.add_argument("--ipv4", help="LAN IPv4 address for SMB, NFS, and OpenBao.")
     storage.add_argument("--apply", action="store_true", help="Publish STORAGE_IP and select this NAS.")
+    commands.add_parser("router-pair", help="Pair Onboardrr with the configured operator router.")
+    router_dns = commands.add_parser("router-dns", help="Preview or update the router's DHCPv4 DNS servers.")
+    router_dns.add_argument("--servers", help="Comma-separated IPv4 DNS server addresses in the advertised order.")
+    router_dns.add_argument("--apply", action="store_true", help="Save and verify the specified DNS server addresses.")
+    router_dns.add_argument("--detect", action="store_true", help="Detect DNS servers on inventory hosts without contacting the router.")
     commands.add_parser("list", help="List registered devices.")
     commands.add_parser("tui", help="Open the interactive terminal interface.")
     automatic.add_parsers(commands)
+    platform = commands.add_parser("install-stack", help="Preview or install OpenBao, Authentik, Komodo, or Pangolin.")
+    platform.add_argument("stack", choices=tuple(automatic.PLATFORM_INSTALL.values()))
+    platform.add_argument("device", metavar="DEVICE")
+    platform.add_argument("--public-key", required=True, type=Path)
+    platform.add_argument("--known-hosts", type=Path, default=Path.home() / ".ssh" / "known_hosts")
+    platform.add_argument("--ask-become-pass", action="store_true")
+    platform.add_argument("--apply", action="store_true")
     usb = commands.add_parser("usb-storage", help="List, mount, unmount, or format Raspberry Pi USB storage.")
     usb.add_argument("device", metavar="DEVICE")
     usb.add_argument("--public-key", required=True, type=Path)
@@ -641,6 +708,14 @@ def main(argv=None, *, sudo_input=None):
     compose_update.add_argument("--apply", action="store_true", help="Apply the selected versions.")
     compose_update.add_argument("--deploy", action="store_true", help="Deploy changed services after updating selected files with --apply.")
 
+    portabase = commands.add_parser("portabase-sync", help="Synchronize database containers with the local Portabase agent file.")
+    portabase.add_argument("device", metavar="DEVICE")
+    portabase.add_argument("--public-key", required=True, type=Path)
+    portabase.add_argument("--known-hosts", type=Path, default=Path.home() / ".ssh" / "known_hosts")
+    portabase.add_argument("--project", help="Portabase project UUID for new sources.")
+    portabase.add_argument("--purge-backups", action="store_true", help="Delete backups of retired Onboardrr-managed sources.")
+    portabase.add_argument("--apply", action="store_true", help="Update the agent file and apply the selected backup cleanup.")
+
     termix = commands.add_parser("termix", help="Register, update, or remove the device's SSH entry in Termix.")
     termix.add_argument("device", metavar="DEVICE")
     termix.add_argument("--address", help="SSH address reachable from Termix.")
@@ -655,7 +730,6 @@ def main(argv=None, *, sudo_input=None):
     prepare.add_argument("--component", choices=automatic.PREPARE_COMPONENTS, help="Run a single preparation step.")
     prepare.add_argument("--public-key", type=Path, help="Enrolled operator key for NAS preparation.")
     prepare.add_argument("--dev-source", help="Optional server SMB share for ~/dev.")
-    prepare.add_argument("--scripts-source", help="Optional server SMB share for ~/scripts.")
     prepare.add_argument("--downloads-source", help="Optional server SMB share for ~/downloads.")
     prepare.add_argument("--plex-source", help="Optional server SMB share for /mnt/goku_plex.")
     prepare.add_argument("--inotify-instances", type=int, help="Optional server fs.inotify.max_user_instances.")
@@ -667,6 +741,8 @@ def main(argv=None, *, sudo_input=None):
     compose_agent = prepare.add_mutually_exclusive_group()
     compose_agent.add_argument("--skip-openbao-agent", action="store_true", help="Skip Compose Agent setup for this Linux host.")
     compose_agent.add_argument("--ensure-openbao-agent", action="store_true", help="Create the missing host AppRole and install the agent.")
+    prepare.add_argument("--require-komodo-agent", action="store_true", help=argparse.SUPPRESS)
+    prepare.add_argument("--render-project", choices=tuple(automatic.PLATFORM_INSTALL.values()), help=argparse.SUPPRESS)
     prepare.add_argument("--skip-monitoring", action="store_true", help="Skip optional monitoring enrollment during QNAP preparation.")
     prepare.add_argument("--ask-become-pass", action="store_true")
     prepare.add_argument("--allow-reboot", action="store_true")
@@ -676,10 +752,13 @@ def main(argv=None, *, sudo_input=None):
     wifi.add_argument("device", metavar="DEVICE")
     wifi.add_argument("--known-hosts", type=Path, default=Path.home() / ".ssh" / "known_hosts")
     wifi.add_argument("--interface", default="wlan0")
-    wifi.add_argument("--band", type=str.upper, choices=BANDS,
+    wifi_mode = wifi.add_mutually_exclusive_group()
+    wifi_mode.add_argument("--disable", action="store_true", help="Disable Wi-Fi after verifying Ethernet SSH.")
+    wifi_mode.add_argument("--sync", action="store_true", help="Sync the current IP and dependent Komodo stacks.")
+    wifi_mode.add_argument("--band", type=str.upper, choices=BANDS,
                       help="Select the 2.4 GHz (2G) or 5 GHz (5G) OpenBao network.")
     wifi.add_argument("--ask-become-pass", action="store_true")
-    wifi.add_argument("--apply", action="store_true", help="Configure and verify Wi-Fi over Ethernet.")
+    wifi.add_argument("--apply", action="store_true", help="Apply the selected network change.")
 
     retire = commands.add_parser("retire", help="Preview or apply retirement of recorded resources.")
     retire.add_argument("device", metavar="DEVICE")
@@ -815,6 +894,8 @@ def main(argv=None, *, sudo_input=None):
     show_run.set_defaults(operation=RunStore.show)
 
     args = parser.parse_args(argv)
+    if args.command == "router-dns" and args.detect and (args.apply or args.servers is not None):
+        parser.error("router-dns --detect cannot be combined with --servers or --apply")
     if args.verbose:
         logging.basicConfig(level=logging.WARNING, format="%(asctime)s · %(message)s", datefmt="%H:%M:%S")
         logging.getLogger("onboardrr").setLevel(logging.INFO)
@@ -898,6 +979,11 @@ def main(argv=None, *, sudo_input=None):
                     raise ValueError("Choose a Compose project, select files, or use --all.")
                 result = update_stack(database, device, args.project, *trust, apply=args.apply,
                                       wud_url=args.wud_url, refresh=args.refresh, files_only=args.files_only)
+        elif args.command == "portabase-sync":
+            from .portabase import sync
+
+            result = sync(database, inventory.get(args.device), args.public_key, args.known_hosts,
+                          apply=args.apply, purge=args.purge_backups, project=args.project)
         elif args.command == "termix":
             from .termix import configured_termix, register
 
@@ -907,6 +993,8 @@ def main(argv=None, *, sudo_input=None):
                               remove=args.remove, address=args.address)
         elif args.command == "prepare":
             result = prepare_command(args, inventory, database)
+        elif args.command == "install-stack":
+            result = platform_stack_command(args, inventory, database)
         elif args.command == "wifi":
             result = wifi_command(args, inventory)
         elif args.command == "usb-storage":
@@ -968,6 +1056,17 @@ def main(argv=None, *, sudo_input=None):
             result = inventory.set_profile(args.name, args.profile)
         elif args.command == "set-storage-nas":
             result = select_primary_storage(inventory, args.device, args.ipv4, apply=args.apply)
+        elif args.command in {"router-pair", "router-dns"}:
+            from .router import maintain
+
+            if args.command == "router-pair":
+                result = maintain(database, pair=True)
+            elif args.detect:
+                from .dns_discovery import discover_dns
+
+                result = discover_dns(database)
+            else:
+                result = maintain(database, servers=args.servers, apply=args.apply)
         else:
             result = inventory.list()
     except (OSError, ValueError, sqlite3.Error) as error:
@@ -980,8 +1079,12 @@ def main(argv=None, *, sudo_input=None):
         or (args.command == "komodo" and args.komodo_command == "unregister" and args.apply and bool(result["blockers"]))
         or (args.command == "reconcile" and result["status"] != "ready")
         or (args.command == "pangolin-network" and result.get("status") == "incomplete")
+        or (args.command == "portabase-sync" and args.apply and bool(
+            result.get("backup_jobs_active") or result.get("backup_cleanup_unavailable")))
         or (args.command == "compose-update" and result.get("status") in {"deployment-incomplete", "files-incomplete"})
         or (args.command == "usb-storage" and args.apply and bool(result.get("blockers")))
+        or (args.command == "wifi" and args.apply and bool(result.get("blockers")))
+        or (args.command == "install-stack" and args.apply and bool(result.get("blockers")))
         or (args.command == "retire-host" and args.apply and bool(result["blockers"]))
         or (args.command == "retire-shell" and args.apply and result["status"] == "review")
         or (args.command == "retire-smb-credentials" and args.apply and result["status"] not in {"removed", "absent"})

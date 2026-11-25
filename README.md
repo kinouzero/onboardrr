@@ -31,7 +31,7 @@ x86-64 and ARM64 on Ubuntu 22.04 and macOS Intel and Apple Silicon on macOS
 Python distributions to PyPI. A manual run on `master` builds preview
 artifacts. Each binary archive and wheel includes a SHA-256 checksum.
 
-Install the wheel with `pipx install ./onboardrr-0.1.0-py3-none-any.whl`.
+Install the wheel with `pipx install ./onboardrr-0.1.1-py3-none-any.whl`.
 For a native archive, extract it and run `./onboardrr` or put the executable
 in a directory on your `PATH`.
 
@@ -88,6 +88,40 @@ Use **Preview** to check readiness and **Apply** to confirm changes.
 **Steps** lists actions in execution order. **Install Docker**
 includes Docker Hub authentication. **Configure Goku** prepares the
 deployment files, the NFS export, and the SMB and NFS mounts.
+
+Use **Maintenance → Pair the operator router** to link Onboardrr with the
+router. The Freebox OS connector asks for approval on the Freebox display.
+In Freebox OS, grant the Onboardrr application access to modify the
+settings. The controller stores the app token in a private file tied to
+the router identity. Pair again after replacing the router.
+
+Open **Maintenance → Router DHCP DNS** to detect DNS servers on inventoried
+hosts and prefill their IPv4 addresses. For each host, the controller tries
+its recorded OpenBao IPv4 address when available, then resolves its inventory
+hostname. It checks private IPv4 addresses for successful recursive DNS
+answers on UDP and TCP port 53 and selects one working address per host.
+Use **Detect DNS servers** to scan again. Edit or reorder the comma-separated
+addresses, use **Preview** to compare them with the DHCP configuration, then
+select **Apply DNS servers** and confirm the update. Onboardrr updates the
+DHCPv4 DNS list and reads it back. Clients receive the list when they obtain
+or renew their DHCP lease.
+
+The default provider and address are Freebox OS and
+`https://mafreebox.freebox.fr`. To select a router explicitly, set
+`router_provider` and `router_url` in
+`~/.config/onboardrr/config.toml`, or use
+`ONBOARDRR_ROUTER_PROVIDER` and `ONBOARDRR_ROUTER_URL`. Freebox OS is the
+currently supported provider. Its HTTPS connection uses the trust roots
+published in the [Freebox OS API documentation](https://dev.freebox.fr/sdk/os/).
+The CLI equivalents are:
+
+```sh
+onboardrr router-pair
+onboardrr router-dns
+onboardrr router-dns --detect
+onboardrr router-dns --servers 192.168.1.17,192.168.1.4
+onboardrr router-dns --servers 192.168.1.17,192.168.1.4 --apply
+```
 
 For a Raspberry Pi with USB storage, choose **Mount USB storage**, load its
 USB devices, and select the data volume. The same step is available as an

@@ -141,8 +141,10 @@ def provision_monitoring(database, device, known_hosts, public_key_path, passwor
             run(client, "start-monitoring", sudo=report["sudo"], password=password, arguments=(staged["compose"], project))
 
 
-def prepare_openbao(database, device, known_hosts, public_key_path, *, apply, ensure):
+def prepare_openbao(database, device, known_hosts, public_key_path, *, apply, ensure, require_core=False,
+                    render_project=None):
     from .compose_agent import configured_compose_agent
+    from .kuma import kuma_on_host
     from .pangolin_network import destination_ipv4
 
     public_key = ssh.load_public_key(public_key_path)
@@ -155,7 +157,8 @@ def prepare_openbao(database, device, known_hosts, public_key_path, *, apply, en
                 return {**result, "mode": "check", "planned_actions": [
                     "Run the OpenBao Agent with native Container Station Compose and render the local environment.",
                 ]}
-            agent = configured_compose_agent(device["name"], ensure=ensure)
+            agent = configured_compose_agent(device["name"], ensure=ensure, require_core=require_core,
+                                             render_project=render_project)
             if not agent:
                 raise ValueError("Configure the OpenBao Compose Agent credentials or use --ensure-openbao-agent.")
             address = agent["host_ip"] or destination_ipv4(device, None)
@@ -164,7 +167,8 @@ def prepare_openbao(database, device, known_hosts, public_key_path, *, apply, en
             if not image:
                 raise ValueError("The OpenBao Agent Compose template is missing an image version.")
             payload = json.dumps({"device": device["name"], "agent": agent, "address": address,
-                                  "port": agent["docker_api_port"] or 2380, "image": image[1]}).encode()
+                                  "port": agent["docker_api_port"] or 2380, "image": image[1],
+                                  "kuma_local": kuma_on_host(client, entware=True)}).encode()
             response = json.loads(ssh.script(client, "nas_openbao.py", payload, timeout=350, entware=True))
             if response.get("status") != "ready":
                 raise ValueError(response.get("error", "NAS OpenBao Agent setup failed."))
@@ -173,11 +177,9 @@ def prepare_openbao(database, device, known_hosts, public_key_path, *, apply, en
 
 def prepare_storage(database, device, known_hosts, public_key_path, endpoint, cifs, nfs, *,
                     apply, password_provider):
-    from .secrets import configured_openbao, storage_smb_record
-
     local = device["name"] == endpoint.name
     report = {"device": device["name"], "mode": "apply" if apply else "check",
-              "compose": "/share/compose" if local else cifs, "periphery": "local" if local else nfs}
+              "compose": "/share/compose" if local else "local", "periphery": "local" if local else nfs}
     if not apply:
         return report
     LOGGER.info("%s: checking access to %s storage", device["name"], "local" if local else "primary NAS")
@@ -197,20 +199,15 @@ def prepare_storage(database, device, known_hosts, public_key_path, endpoint, ci
                 sudo = ssh.sudo_access(client, uid, password) if password else sudo
             if sudo == "unavailable":
                 raise ValueError("Mounting the primary NAS shares requires QTS sudo access.")
-            bao = configured_openbao()
-            if bao is None:
-                raise ValueError("Configure OpenBao to retrieve the primary NAS SMB credentials.")
-            user, secret = bao.read(storage_smb_record(endpoint.name), "smb_username", "smb_password")
             if nfs.partition(":/")[2] == f"onboardrr-{device['name']}":
                 from .goku_export import ensure_goku_export
                 from .pangolin_network import destination_ipv4
 
                 ensure_goku_export(endpoint, device["name"], destination_ipv4(device, None))
-            LOGGER.info("%s: mounting SMB and NFS and registering QTS restart recovery", device["name"])
+            LOGGER.info("%s: mounting Periphery NFS storage and registering QTS restart recovery", device["name"])
             runner = (ssh.REMOTE / "nas_mount.py").read_text()
             payload = json.dumps({"config": {"home": operator["home"], "uid": uid, "gid": gid,
-                                             "device": device["name"], "cifs": cifs, "nfs": nfs,
-                                             "username": user, "password": secret}, "runner": runner}).encode()
+                                             "device": device["name"], "nfs": nfs}, "runner": runner}).encode()
             result = run(client, "compose-mount", sudo=sudo, password=password, payload=payload, arguments=(runner,))
             if result.get("ready") != "yes":
                 raise ValueError(result.get("error", "Could not mount the primary NAS shares."))

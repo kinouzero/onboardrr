@@ -204,7 +204,7 @@
     follow: false
   become: false
   remote_user: "{{ onboardrr_user }}"
-  loop: [.docker, .logs, scripts, .config, .config/docker]
+  loop: [.docker, .logs, .config, .config/docker]
 
 - name: Authenticate the operator to Docker Hub
   tags: [docker-auth]

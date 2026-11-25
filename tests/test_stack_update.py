@@ -17,6 +17,16 @@ def observation(identifier, current, offered):
     }
 
 
+KOMODO_PAIR = {
+    "komodo-postgres": "ghcr.io/ferretdb/postgres-documentdb:17-0.107.0-ferretdb-2.7.0",
+    "komodo-ferretdb": "ghcr.io/ferretdb/ferretdb:2.7.0",
+}
+KOMODO_UPDATE = {
+    "komodo-postgres": "ghcr.io/ferretdb/postgres-documentdb:17-0.108.0-ferretdb-2.8.0",
+    "komodo-ferretdb": "ghcr.io/ferretdb/ferretdb:2.8.0",
+}
+
+
 class WudVersionsTest(unittest.TestCase):
     def test_host_update_deploys_only_matched_projects_and_reports_independent_failures(self):
         device = {"name": "nas", "profile": "nas"}
@@ -118,6 +128,27 @@ class WudVersionsTest(unittest.TestCase):
         self.assertEqual(report["services"], ["core", "other"])
         self.assertEqual(list(report["updates"]), ["core"])
 
+    def test_file_preview_waits_for_matching_komodo_releases_and_preserves_postgres_major(self):
+        original = "services:\n" + "".join(f"  {name}:\n    image: {image}\n" for name, image in KOMODO_PAIR.items())
+        offered = []
+        for service, image in KOMODO_PAIR.items():
+            name, old = image.removeprefix("ghcr.io/").split(":")
+            item = observation(service, old, KOMODO_UPDATE[service].split(":")[1])
+            item["image"].update({"name": name, "registry": {"url": "https://ghcr.io/v2"},
+                                  "os": "linux", "architecture": "amd64"})
+            offered.append(item)
+        updated, report = plan_compose_file(original, "x86_64", "zero", offered[1:])
+        self.assertEqual(updated, original)
+        self.assertIn("matching", report["skipped"]["komodo-ferretdb"])
+        updated, report = plan_compose_file(original, "x86_64", "zero", offered)
+        self.assertEqual({name: item["to"] for name, item in report["updates"].items()}, KOMODO_UPDATE)
+        self.assertTrue(all(image in updated for image in KOMODO_UPDATE.values()))
+        self.assertEqual(plan_compose_file(original, "x86_64", "zero", offered, resume_database=True)[0], original)
+        offered[0]["result"]["tag"] = offered[0]["result"]["tag"].replace("17-", "18-", 1)
+        updated, report = plan_compose_file(original, "x86_64", "zero", offered)
+        self.assertEqual(updated, original)
+        self.assertIn("major upgrade", report["skipped"]["komodo-postgres"])
+
     def test_uses_exact_container_and_deployed_tag(self):
         snapshot = {
             "containers": [{"id": "selected", "service": "web", "image": "repo:1.2"}],
@@ -150,8 +181,55 @@ class WudVersionsTest(unittest.TestCase):
 
 
 class ComposeUpdateTest(unittest.TestCase):
+    def test_komodo_database_upgrade_verifies_extension_before_starting_clients_and_resumes(self):
+        directory = self.directory
+        desired = {**KOMODO_UPDATE, "web": "repo:2"}
+        command = ["compose", "--project-name", "komodo"]
+        plan = [("komodo", directory, command, desired)]
+        checkpoint = compose_update.komodo_database_checkpoint(directory)
+        fail_extension = True
+
+        def docker(arguments, stage, **options):
+            if stage == "DocumentDB extension upgrade and verification":
+                self.assertIn("ALTER EXTENSION documentdb UPDATE", options["payload"])
+                if fail_extension:
+                    raise ValueError("DocumentDB extension upgrade failed.")
+
+        with (patch.object(compose_update, "configured_images", return_value=desired),
+              patch.object(compose_update, "docker", side_effect=docker) as runner):
+            self.assertEqual(compose_update.deploy_selected(plan)[0]["status"], "failed")
+            self.assertEqual(json.loads(checkpoint.read_text()), KOMODO_UPDATE)
+            self.assertEqual([call.args[0][-1] for call in runner.call_args_list if "up" in call.args[0]],
+                             ["komodo-postgres"])
+            fail_extension = False
+            runner.reset_mock()
+            self.assertEqual(compose_update.deploy_selected(plan)[0]["status"], "deployed")
+            self.assertEqual([call.args[0][-1] for call in runner.call_args_list if "up" in call.args[0]],
+                             ["komodo-postgres", "komodo-ferretdb", "komodo", "web"])
+            stages = [call.args[1] for call in runner.call_args_list]
+            self.assertLess(stages.index("pause Komodo database clients"),
+                            stages.index("DocumentDB extension upgrade and verification"))
+            self.assertFalse(checkpoint.exists())
+
+    def test_komodo_checkpoint_matches_stopped_database_services_when_wud_has_no_updates(self):
+        directory = self.directory.resolve()
+        path = directory / "compose.komodo.yml"
+        path.touch()
+        compose_update.komodo_database_checkpoint(directory).write_text(json.dumps(KOMODO_UPDATE))
+        rows = [
+            [name + "-id", image, name, str(directory), str(path), self.environment_label]
+            for name, image in {**KOMODO_PAIR, "komodo-postgres": KOMODO_UPDATE["komodo-postgres"]}.items()
+        ]
+        deployment = {"images": {path.name: KOMODO_UPDATE}, "updated": {}, "wud_tags": []}
+        with (patch.object(compose_update, "inspect_compose_containers",
+                           side_effect=[[[*rows[0], "komodo"]], rows]),
+              patch.object(compose_update, "source_environment", return_value=({}, {})),
+              patch.object(compose_update, "AGENT_STATE", self.directory)):
+            (_, _, _, targets), = compose_update.deployment_plan({path.name: (path,)}, deployment)
+        self.assertEqual(targets, KOMODO_UPDATE)
+
     def test_deploys_only_changed_services_using_recorded_files_and_can_retry(self):
-        base = self.directory / ".docker/compose/lab"
+        base = (self.directory / ".docker/compose").resolve()
         base.mkdir(parents=True)
         target = base / "compose.yaml"
         companion = base / "docker-compose.extra.yml"
@@ -214,7 +292,7 @@ class ComposeUpdateTest(unittest.TestCase):
             self.assertEqual(apply({}, {})["status"], "no-updates")
 
     def test_deploy_blocks_before_writing_when_the_local_stack_cannot_be_matched(self):
-        base = self.directory / ".docker/compose/lab"
+        base = (self.directory / ".docker/compose").resolve()
         base.mkdir(parents=True)
         target = base / "compose.yaml"
         original = "services:\n  web:\n    image: repo:1.2\n"
@@ -233,8 +311,10 @@ class ComposeUpdateTest(unittest.TestCase):
         self.assertEqual(target.read_text(), original)
 
     def test_selected_workspace_updates_original_files_and_guards_the_snapshot(self):
-        base = self.directory / ".docker/compose/lab"
+        base = self.directory / ".docker/compose"
         base.mkdir(parents=True)
+        (base / "lab").mkdir()
+        (base / "lab/compose.komodo.yml").touch()
         target = base / "compose.yaml"
         target.write_text("services: {}\n")
         second = base / "docker-compose.worker.yml"
@@ -243,6 +323,7 @@ class ComposeUpdateTest(unittest.TestCase):
         (base / "linked-compose.yml").symlink_to(target)
         with patch.object(Path, "home", return_value=self.directory):
             selection = compose_update.compose_files({"action": "list-files", "host": "lab"})
+            self.assertEqual(selection["workspace"], str(base.resolve()))
             self.assertEqual(selection["files"], [target.name, second.name])
             request = {"host": "lab", "workspace": selection["workspace"], "files": selection["files"]}
             snapshot = compose_update.compose_files({**request, "action": "read-files"})
@@ -257,6 +338,25 @@ class ComposeUpdateTest(unittest.TestCase):
                 compose_update.compose_files(write)
             with self.assertRaisesRegex(ValueError, "regular Compose"):
                 compose_update.compose_files({**request, "action": "read-files", "files": ["linked-compose.yml"]})
+            with self.assertRaisesRegex(ValueError, "directly"):
+                compose_update.compose_files({**request, "action": "read-files", "files": ["lab/compose.komodo.yml"]})
+
+    def test_platform_wud_deploy_uses_the_flat_manifest_as_its_source(self):
+        target = self.directory.resolve() / "compose.openbao.yml"
+        target.touch()
+        name = "openbao-agent-compose"
+        old_directory = self.directory / "old"
+        row = ["container", "openbao:1", name, str(old_directory), str(old_directory / "compose.yaml"),
+               self.environment_label, "secrets"]
+        deployment = {"images": {target.name: {name: "openbao:2"}}, "updated": {target.name: [name]},
+                      "wud_tags": []}
+        with (patch.object(compose_update, "inspect_compose_containers", return_value=[row]),
+              patch.object(compose_update, "source_environment", return_value=({}, {})),
+              patch.object(compose_update, "AGENT_STATE", self.directory)):
+            (project, directory, command, targets), = compose_update.deployment_plan({target.name: (target,)}, deployment)
+        self.assertEqual((project, directory, targets), ("secrets", target.parent, {name: "openbao:2"}))
+        self.assertIn(str(target), command)
+        self.assertNotIn(str(old_directory / "compose.yaml"), command)
 
     def test_shell_hostname_does_not_override_compose_configuration(self):
         with patch.dict(os.environ, {"HOSTNAME": "shell-host"}):
@@ -452,6 +552,43 @@ class ComposeUpdateTest(unittest.TestCase):
                     compose_update.dcu_command(["-p", "lab"], self.directory)
             docker.assert_not_called()
 
+    def test_dcu_named_komodo_selects_the_file_and_layers_managed_environments(self):
+        (self.directory / "compose-agent-projects.json").touch()
+        periphery = self.directory / "compose.komodo.yml"
+        periphery.touch()
+        config = str(self.directory / "cache" / "config.env")
+        passkeys = str(self.directory / "cache" / "periphery.env")
+        with (
+            patch.object(compose_update, "AGENT_STATE", self.directory),
+            patch.object(compose_update, "agent_environment", side_effect=[[config], [config, passkeys],
+                                                                           [config, passkeys]]) as agent,
+            patch.object(compose_update, "docker") as docker,
+        ):
+            result = compose_update.dcu_command(["komodo", "--dry-run", "--no-deps"], self.directory)
+        self.assertEqual([operation.args[0] for operation in agent.call_args_list], ["config", "periphery", "komodo"])
+        docker.assert_not_called()
+        self.assertEqual(result, ["compose", "--dry-run", "--file", str(periphery.resolve()), "--project-name", "komodo",
+                                  "--env-file", config, "--env-file", passkeys, "up", "--detach", "--no-deps"])
+
+    def test_dcu_keeps_a_service_argument_when_no_named_file_matches(self):
+        with patch.object(compose_update, "AGENT_STATE", self.directory):
+            self.assertEqual(compose_update.dcu_command(["web"], self.directory),
+                             ["compose", "up", "--detach", "web"])
+
+    def test_dcu_uses_the_installed_periphery_environment_with_the_flat_manifest(self):
+        installed = (self.directory / ".docker/compose").resolve()
+        installed.mkdir(parents=True)
+        compose = installed / "compose.komodo.yml"
+        compose.touch()
+        rows = [["id", "image", "komodo-agent", str(installed), str(compose), ""]]
+        with (patch.object(compose_update.Path, "home", return_value=self.directory),
+              patch.object(compose_update, "inspect_compose_containers", return_value=rows),
+              patch.object(compose_update, "agent_environment") as agent):
+            result = compose_update.dcu_command(["--dry-run", "komodo"], installed)
+        agent.assert_not_called()
+        self.assertEqual(result, ["compose", "--dry-run", "--project-directory", str(installed),
+                                  "--file", str(compose), "--project-name", "komodo", "up", "--detach"])
+
     def test_nas_dcu_uses_the_private_rendered_environment_with_container_station(self):
         cache = self.directory / ".config/docker/openbao/compose/cache"
         cache.mkdir(parents=True)
@@ -471,6 +608,8 @@ class ComposeUpdateTest(unittest.TestCase):
                 "up", "--detach",
             ])
             self.assertEqual(compose_update.docker_environment()["DOCKER_HOST"], "unix:///var/run/docker.sock")
+            with patch.dict(compose_update.os.environ, {}, clear=True):
+                self.assertEqual(compose_update.docker_environment()["DOCKER_CONFIG"], str(self.directory / ".docker"))
             rendered.chmod(0o644)
             with self.assertRaisesRegex(ValueError, "not private"):
                 compose_update.dcu_command(["-p", "lab"], self.directory)

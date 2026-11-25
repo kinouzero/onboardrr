@@ -1,6 +1,8 @@
 import base64
 import json
 import os
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -23,11 +25,55 @@ class ComposeAgentTest(unittest.TestCase):
                          / "openbao-agent.compose.yaml.j2")
         environment = jinja2.Environment(undefined=jinja2.StrictUndefined)
         environment.filters["to_json"] = json.dumps
+        environment.filters["from_json"] = json.loads
+        environment.globals.update(
+            onboardrr_compose_agent={"url": "https://bao.example"},
+            onboardrr_openbao_host_ip="192.0.2.12",
+            onboardrr_openbao_docker_api_port=2381,
+        )
         template = environment.from_string(template_path.read_text())
         endpoints = yaml.safe_load((template_path.parent.parent / "defaults/main.yml").read_text())[
             "onboardrr_openbao_internal_endpoints"
         ]
-        for host in ("zero", "lab"):
+        unified = yaml.safe_load(template.render(
+            onboardrr_name="zero", onboardrr_openbao_internal_endpoint=endpoints["zero"],
+            onboardrr_kuma={"stdout": '{"local":true}'},
+            onboardrr_account=["", "1001", "1002"], onboardrr_agent_specs=[
+                {"variant": "compose", "directory": "/home/operator/compose", "output": "cache"},
+                {"variant": "komodo", "directory": "/home/operator/komodo", "output": "rendered"},
+            ],
+        ))
+        self.assertEqual(set(unified["services"]), {"openbao-agent-compose", "openbao-agent-komodo"})
+        self.assertEqual(unified["services"]["openbao-agent-komodo"]["volumes"][1]["source"],
+                         "/home/operator/komodo/rendered")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for output in ("agent", "cache", "rendered"):
+                (root / output).mkdir()
+            config = root / "agent/agent.hcl"
+            for variant, configuration, paths in (
+                ("compose", json.dumps({"template": [
+                    {"destination": "/cache/config.env"},
+                    {"destination": "/cache/project.env"},
+                ]}, indent=2), ("cache/config.env", "cache/project.env")),
+                ("komodo", 'template {\n  destination = "/rendered/core.config.toml"\n}\n',
+                 ("rendered/core.config.toml",)),
+            ):
+                with self.subTest(healthcheck=variant):
+                    kind, script = unified["services"][f"openbao-agent-{variant}"]["healthcheck"]["test"]
+                    self.assertEqual(kind, "CMD-SHELL")
+                    for prefix in ("/agent/", "/cache/", "/rendered/"):
+                        script = script.replace(prefix, str(root) + prefix)
+                        configuration = configuration.replace(prefix, str(root) + prefix)
+                    config.write_text(configuration)
+                    command = ["sh", "-c", script.replace("$$", "$")]
+                    self.assertEqual(subprocess.run(command).returncode, 1)
+                    for path in paths:
+                        (root / path).write_text("fixture")
+                    self.assertEqual(subprocess.run(command).returncode, 0)
+                    (root / paths[-1]).write_text("")
+                    self.assertEqual(subprocess.run(command).returncode, 1)
+        for host, kuma_local in (("zero", False), ("lab", True)):
             for variant, output, releases in (
                 ("compose", "cache", "moghtech/komodo"),
                 ("komodo", "rendered", "openbao/openbao"),
@@ -36,6 +82,7 @@ class ComposeAgentTest(unittest.TestCase):
                     name = f"openbao-agent-{variant}"
                     compose = yaml.safe_load(template.render(
                         onboardrr_name=host, onboardrr_agent_variant=variant,
+                        onboardrr_kuma={"stdout": json.dumps({"local": kuma_local})},
                         onboardrr_openbao_internal_endpoint=endpoints.get(host, {}),
                         onboardrr_account=["", "1001", "1002"], onboardrr_agent_output=output,
                         onboardrr_agent_directory=f"/home/operator/.config/docker/openbao/{variant}",
@@ -54,16 +101,16 @@ class ComposeAgentTest(unittest.TestCase):
                         self.assertNotIn("networks", compose)
                         self.assertEqual(service.get("network_mode"), "bridge" if variant == "compose" else None)
                     labels = service["labels"]
-                    endpoint = ('"socket", "/var/run/docker.sock"' if host == "zero"
-                                else '"tcp", "http://${HOST_IP}:${DOCKER_API_PORT}"')
+                    endpoint = ('"socket", "/var/run/docker.sock"' if kuma_local
+                                else '"tcp", "http://192.0.2.12:2381"')
                     self.assertEqual(labels, {
                         "docker.stack": "secrets",
-                        "homepage.href": "${URL_BAO}",
-                        "homepage.group": "Docker ${DOCKER_HOSTNAME}",
+                        "homepage.href": "https://bao.example",
+                        "homepage.group": f"Docker {host}",
                         "homepage.icon": "sh-openbao",
                         "homepage.name": name,
                         "komodo.skip": None,
-                        "kuma.__docker": f'"${{DOCKER_HOSTNAME}}", {endpoint}',
+                        "kuma.__docker": f'"{host}", {endpoint}',
                         "wud.display.icon": "sh-openbao",
                         "wud.display.name": name,
                         "wud.link.template": f"https://github.com/{releases}/releases",

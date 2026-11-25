@@ -2,7 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 from onboardrr.http_json import HttpStatusError
 from onboardrr.inventory import PROFILE, SERVER_PROFILE, Inventory
@@ -108,6 +108,54 @@ class KomodoTest(unittest.TestCase):
             self.assertEqual(json.loads(request.kwargs["body"]), {"type": "GetVersion", "params": {}})
             self.assertEqual(request.kwargs["headers"]["X-Api-Secret"], "fixture-api-secret")
             connection.close.assert_called_once()
+
+    def test_read_recovers_from_a_timeout_and_a_gateway_restart(self):
+        with (patch("onboardrr.http_json.http.client.HTTPSConnection") as factory,
+              patch("onboardrr.komodo.sleep") as pause):
+            retry = Mock(status=503)
+            success = Mock(status=200)
+            success.read.return_value = b'{"version":"2.3.4"}'
+            connection = factory.return_value
+            connection.getresponse.side_effect = [TimeoutError(), retry, success]
+            self.assertEqual(self.komodo.version(), "2.3.4")
+            self.assertEqual([call.args[0] for call in pause.call_args_list], [2, 5])
+            self.assertEqual(connection.close.call_count, 3)
+
+    def test_deployment_is_submitted_once_if_the_response_is_lost(self):
+        with (patch("onboardrr.http_json.http.client.HTTPSConnection") as factory,
+              patch("onboardrr.komodo.sleep") as pause):
+            connection = factory.return_value
+            connection.getresponse.side_effect = TimeoutError()
+            with self.assertRaisesRegex(ValueError, "DeployStack could not complete over HTTPS"):
+                self.komodo._request("/execute", "DeployStack", {"stack": "lab"})
+            connection.request.assert_called_once()
+            pause.assert_not_called()
+
+    def test_sync_periphery_ip_previews_and_updates_only_the_address(self):
+        old = "https://192.0.2.10:8120/"
+        new = "https://192.0.2.20:8120/"
+        servers = [{"id": SERVER_ID, "name": "lab", "info": {"address": old}}]
+        before = {"config": {"address": old, "enabled": True, "passkey": PASSKEY}}
+        after = {"config": {**before["config"], "address": new}}
+        with patch.object(self.komodo, "_request", side_effect=[servers, before, servers, before, {}, after]) as rpc:
+            self.assertEqual(self.komodo.sync_periphery_ip("lab", "192.0.2.20", apply=False),
+                             {"komodo_periphery_address": new})
+            self.assertTrue(all(request.args[0] == "/read" for request in rpc.call_args_list))
+            self.assertEqual(self.komodo.sync_periphery_ip("lab", "192.0.2.20", apply=True),
+                             {"komodo_periphery_address": new})
+        self.assertEqual(rpc.call_args_list[-2:], [
+            call("/write", "UpdateServer", {"id": SERVER_ID, "config": {"address": new}}),
+            call("/read", "GetServer", {"server": SERVER_ID}),
+        ])
+
+    def test_sync_periphery_ip_preserves_outbound_hostname_and_current_ip(self):
+        for endpoint in ("", ADDRESS, "https://192.0.2.20:8120"):
+            with self.subTest(endpoint=endpoint), patch.object(self.komodo, "_request", side_effect=[
+                [{"id": SERVER_ID, "name": "lab", "info": {"address": endpoint}}],
+                {"config": {"address": endpoint}},
+            ]) as rpc:
+                self.assertEqual(self.komodo.sync_periphery_ip("lab", "192.0.2.20", apply=True), {})
+                self.assertTrue(all(request.args[0] == "/read" for request in rpc.call_args_list))
 
     def test_reference_output_contains_no_configuration_secrets(self):
         with patch.object(self.komodo, "_request", side_effect=[

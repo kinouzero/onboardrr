@@ -39,6 +39,8 @@ def prepare_linux(device, known_hosts, cifs_source, nfs_source, bao, *,
         variables["onboardrr_component"] = component
     if compose_agent is not None:
         variables["onboardrr_compose_agent"] = compose_agent
+        probe = (PACKAGE_PATH / "remote/kuma.py").read_bytes()
+        variables["onboardrr_kuma_probe_b64"] = base64.b64encode(probe).decode()
     if docker_auth is not None and not check:
         variables["onboardrr_docker_auth"] = docker_auth
     if inotify_instances is not None:
@@ -62,25 +64,55 @@ def prepare_linux(device, known_hosts, cifs_source, nfs_source, bao, *,
     if system_only:
         variables["onboardrr_system_only"] = True
     else:
+        variables["onboardrr_nfs_source"] = nfs_source
+    extra_shares = {name: source for name, source in (optional_mounts or {}).items() if source}
+    if not system_only and extra_shares:
         username, password = bao.read(storage_smb_record(storage_name), "smb_username", "smb_password")
         if any("\r" in value or "\n" in value for value in (username, password)):
             raise ValueError("OpenBao returned invalid SMB credentials.")
         variables.update({
-            "onboardrr_cifs_source": cifs_source,
-            "onboardrr_nfs_source": nfs_source,
             "onboardrr_smb_credentials_file": f"/etc/onboardrr/{name}-goku.smb",
             "onboardrr_managed_smb_credentials": True,
             "onboardrr_smb_username_b64": base64.b64encode(username.encode()).decode("ascii"),
             "onboardrr_smb_password_b64": base64.b64encode(password.encode()).decode("ascii"),
-            "onboardrr_optional_mounts": {name: source for name, source in (optional_mounts or {}).items() if source},
+            "onboardrr_optional_mounts": extra_shares,
         })
     return run_playbook(device, known_hosts, "prepare.yml", variables, check=check,
                         become_password=become_password)
 
 
-def run_playbook(device, known_hosts, playbook, variables, *, check, become_password=None):
+def trusted_ssh_target(device, known_hosts, address=None):
     if not known_hosts.is_file():
         raise ValueError("Provide the SSH known_hosts file for the target.")
+    host, port = device["host"], device["ssh_port"]
+    destination = address if address is not None else ssh_destination(host)
+    known_host = host if port == 22 else f"[{host}]:{port}"
+    key_alias = [] if destination == host else ["-o", f"HostKeyAlias={known_host}"]
+    return destination, [
+        "-F", "/dev/null", "-o", "StrictHostKeyChecking=yes", "-o", "GlobalKnownHostsFile=/dev/null",
+        "-o", f"UserKnownHostsFile={json.dumps(str(known_hosts.resolve()), ensure_ascii=False)}",
+        "-o", "BatchMode=yes", "-o", "ControlMaster=no", *key_alias,
+    ]
+
+
+def run_ssh_probe(device, known_hosts, script, *, address=None, payload=None, privileged=False, timeout=22):
+    destination, options = trusted_ssh_target(device, known_hosts, address)
+    source = (PACKAGE_PATH / "remote" / script).read_text()
+    interpreter = ["sudo", "-n", "--", "python3"] if privileged else ["python3"]
+    try:
+        result = subprocess.run(
+            ["ssh", *options, "-o", "ConnectTimeout=6", "-p", str(device["ssh_port"]), "-l", device["ssh_user"],
+             "--", destination, shlex.join((*interpreter, "-c", source))],
+            input=json.dumps(payload) if payload is not None else None,
+            capture_output=True, text=True, timeout=timeout, check=True, env=system_environment(),
+        )
+        return json.loads(result.stdout)
+    except (OSError, subprocess.SubprocessError, ValueError) as error:
+        raise ValueError(f"Could not complete the trusted SSH check at {destination}.") from error
+
+
+def run_playbook(device, known_hosts, playbook, variables, *, check, become_password=None, address=None):
+    destination, ssh_options = trusted_ssh_target(device, known_hosts, address)
     environment = {
         **system_environment(), "ANSIBLE_HOST_KEY_CHECKING": "True", "ANSIBLE_SSH_HOST_KEY_CHECKING": "True",
     }
@@ -92,20 +124,12 @@ def run_playbook(device, known_hosts, playbook, variables, *, check, become_pass
     if become_password is not None:
         variables["onboardrr_sudo_b64"] = base64.b64encode(become_password.encode()).decode("ascii")
         variables["ansible_become_password"] = "{{ onboardrr_sudo_b64 | b64decode }}"
-    host, port = device["host"], device["ssh_port"]
-    destination = ssh_destination(host)
-    known_host = host if port == 22 else f"[{host}]:{port}"
-    key_alias = [] if destination == host else ["-o", f"HostKeyAlias={known_host}"]
     settings = {
         "ansible_connection": "ssh",
         "ansible_host": destination,
-        "ansible_port": port,
+        "ansible_port": device["ssh_port"],
         "ansible_user": device["ssh_user"],
-        "ansible_ssh_args": shlex.join([
-            "-F", "/dev/null", "-o", "StrictHostKeyChecking=yes", "-o", "GlobalKnownHostsFile=/dev/null",
-            "-o", f"UserKnownHostsFile={json.dumps(str(known_hosts.resolve()), ensure_ascii=False)}",
-            "-o", "BatchMode=yes", "-o", "ControlMaster=no", *key_alias,
-        ]),
+        "ansible_ssh_args": shlex.join(ssh_options),
     }
     with TemporaryDirectory() as directory:
         inventory_path = Path(directory) / "inventory.yml"

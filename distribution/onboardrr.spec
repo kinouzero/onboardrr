@@ -10,6 +10,7 @@ analysis = Analysis(
     pathex=[str(root)],
     datas=[
         (str(root / "onboardrr" / "tui.tcss"), "onboardrr"),
+        (str(root / "onboardrr" / "freebox-ca.pem"), "onboardrr"),
         *((str(script), "onboardrr/remote")
           for script in (root / "onboardrr" / "remote").iterdir()
           if script.suffix in {".py", ".sh"}),

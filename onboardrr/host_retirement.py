@@ -124,7 +124,10 @@ def retire_host(database, device, komodo, known_hosts, public_key, *,
                 outbound_file = str(home / ".config/onboardrr/periphery/compose.yaml")
                 servers = [item for item in actions if item["kind"] == ResourceKind.KOMODO_SERVER]
                 owns_outbound = len(servers) == 1 and servers[0]["action"] == "remove"
-        if stop_periphery and not (compose_file or outbound_file):
+        servers = [item for item in actions if item["kind"] == ResourceKind.KOMODO_SERVER]
+        owns_outbound = len(servers) == 1 and servers[0]["action"] == "remove"
+        outbound_operator = device["ssh_user"] if not outbound_file and owns_outbound else None
+        if stop_periphery and not (compose_file or outbound_file or outbound_operator):
             raise ValueError("The run does not record a Periphery deployment that can be checked for retirement.")
         if apply:
             ensure_stacks_detached(komodo, name, actions)
@@ -133,5 +136,6 @@ def retire_host(database, device, komodo, known_hosts, public_key, *,
             device, known_hosts, public_key, {
                 "mounts": mounts, "compose_file": compose_file, "stop_periphery": stop_periphery, "apply": apply,
                 "device": name, "outbound_file": outbound_file, "owns_outbound": owns_outbound, "network": network,
+                **({"outbound_operator": outbound_operator} if outbound_operator else {}),
             }, privileged=apply, password=password,
         )

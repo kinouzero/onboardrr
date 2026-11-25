@@ -12,14 +12,13 @@
       - not onboardrr_shell_config.stat.exists or onboardrr_shell_config.stat.uid == onboardrr_account[1] | int
     fail_msg: The operator's shell configuration is not a regular file owned by the account.
 
-- name: Prepare a local Compose workspace when Goku mounts are skipped
+- name: Prepare the host's Compose workspace
   ansible.builtin.file:
-    path: "{{ onboardrr_home }}/.docker/compose/{{ onboardrr_name }}"
+    path: "{{ onboardrr_home }}/.docker/compose"
     state: directory
     follow: false
   become: false
   remote_user: "{{ onboardrr_user }}"
-  when: onboardrr_system_only | default(false) | bool
 
 - name: Install the local Compose launcher
   ansible.builtin.copy:
@@ -39,7 +38,7 @@
     path: "{{ onboardrr_home }}/.bashrc"
     marker: "# {mark} ONBOARDRR MANAGED BLOCK"
     block: |
-      alias cdcompose='cd "$HOME/.docker/compose/{{ onboardrr_name }}"'
+      alias cdcompose='cd "$HOME/.docker/compose"'
       {% if onboardrr_profile | default('raspberry-pi') == 'server' %}
       alias cdconfig='cd "$HOME/.config/docker"'
       {% endif %}

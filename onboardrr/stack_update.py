@@ -11,7 +11,9 @@ import yaml
 from .http_json import HttpStatusError, JsonService
 from .image_versions import labels_dict, mapping_node
 from .inventory import NAS_PROFILE
-from .remote.compose_update import PROJECT, TAG, tag_reference
+from .remote.compose_update import (
+    PROJECT, TAG, komodo_database_images, tag_reference, validate_komodo_database_update,
+)
 from .secrets import configured_openbao, integration_credentials
 from .storage import device_lock
 
@@ -69,7 +71,7 @@ def compose_version(image, labels, platform, hostname, observations):
     return next(iter(tags), None)
 
 
-def plan_compose_file(text, architecture, hostname, observations, *, deployment_images=None):
+def plan_compose_file(text, architecture, hostname, observations, *, deployment_images=None, resume_database=False):
     try:
         source = yaml.compose(text, Loader=yaml.SafeLoader)
         document = yaml.safe_load(text)
@@ -80,7 +82,10 @@ def plan_compose_file(text, architecture, hostname, observations, *, deployment_
         raise ValueError("The file does not declare Compose services.")
     nodes = mapping_node(source, "services")
     arch = {"aarch64": "arm64", "x86_64": "amd64", "armv7l": "arm/v7"}.get(architecture, architecture)
-    edits = []
+    images = {name: service.get("image") for name, service in services.items()
+              if isinstance(service, dict) and isinstance(service.get("image"), str)}
+    database = komodo_database_images(images)
+    edits = {}
     report = {"services": list(services), "updates": {}, "skipped": {}}
     for name, service in services.items():
         if not isinstance(service, dict) or not isinstance(service.get("image"), str):
@@ -91,7 +96,8 @@ def plan_compose_file(text, architecture, hostname, observations, *, deployment_
             report["skipped"][name] = "The service platform could not be resolved."
             continue
         try:
-            tag = compose_version(image, labels_dict(service.get("labels")), platform.split("/"), hostname, observations)
+            tag = None if resume_database and name in database else compose_version(
+                image, labels_dict(service.get("labels")), platform.split("/"), hostname, observations)
         except ValueError as error:
             report["skipped"][name] = str(error)
             continue
@@ -113,11 +119,22 @@ def plan_compose_file(text, architecture, hostname, observations, *, deployment_
         if not tag:
             continue
         target = tag_reference(image, tag)
-        edits.append((start, end, f"{quote}{target}{quote}"))
+        edits[name] = (start, end, f"{quote}{target}{quote}")
         report["updates"][name] = {"from": image, "to": target}
-    if len({start for start, _, _ in edits}) != len(edits):
+    database_updates = database.keys() & report["updates"].keys()
+    if database_updates:
+        desired = {**database, **{name: report["updates"][name]["to"] for name in database_updates}}
+        try:
+            validate_komodo_database_update(database, desired)
+        except ValueError as error:
+            for name in database_updates:
+                del edits[name], report["updates"][name]
+                report["skipped"][name] = str(error)
+                if deployment_images is not None:
+                    deployment_images[name] = database[name]
+    if len({start for start, _, _ in edits.values()}) != len(edits):
         raise ValueError("The images to update share a YAML scalar.")
-    for start, end, replacement in sorted(edits, reverse=True):
+    for start, end, replacement in sorted(edits.values(), reverse=True):
         text = text[:start] + replacement + text[end:]
     return text, report
 
@@ -234,7 +251,8 @@ def manage_compose_files(database, device, known_hosts, public_key_file, *, file
             targets = {} if deploy else None
             try:
                 updated, reports[path] = plan_compose_file(
-                    original["text"], snapshot["architecture"], device["name"], observations, deployment_images=targets)
+                    original["text"], snapshot["architecture"], device["name"], observations, deployment_images=targets,
+                    resume_database=original.get("resume_database", False))
             except ValueError as error:
                 reports[path] = {"error": str(error)}
                 continue
@@ -244,12 +262,13 @@ def manage_compose_files(database, device, known_hosts, public_key_file, *, file
                 images[path] = targets
         result = {"status": "no-updates" if apply else "preview"}
         watched = list(wud_tag_changes(observations)) if apply and deploy else []
-        if apply and (changes or (images and watched)):
+        resume = deploy and any(original.get("resume_database") for original in snapshot["files"].values())
+        if apply and (changes or (images and watched) or resume):
             LOGGER.info("Saving %d Compose files. Deployment %s", len(changes), "requested" if deploy else "disabled")
             options = {}
             if deploy:
                 options = {
-                    "timeout": 960 * len(images),
+                    "timeout": 960 * len(images) + (960 if "compose.komodo.yml" in images else 0),
                     "deployment": {
                         "images": images,
                         "updated": {path: list(reports[path]["updates"]) for path in changes},

@@ -106,6 +106,43 @@ class TerminalCommandTest(unittest.TestCase):
 
 
 class TerminalAppTest(unittest.IsolatedAsyncioTestCase):
+    async def test_router_dns_maintenance_previews_and_confirms_without_an_inventory_host(self):
+        with tempfile.TemporaryDirectory() as directory:
+            app = OnboardrrApp(Path(directory) / "inventory.sqlite3")
+            async with app.run_test(size=(100, 32)) as pilot:
+                self.assertFalse(app.query_one("#section-maintenance", Button).disabled)
+                app.navigate("maintenance", "router-dns")
+                await pilot.pause()
+                with patch.object(app, "launch") as launch:
+                    self.assertTrue(await pilot.click("#run"))
+                    launch.assert_called_once_with(["router-dns"], False)
+                    launch.reset_mock()
+                    app.query_one("#argument", Input).value = "192.168.1.17,192.168.1.4"
+                    self.assertTrue(await pilot.click("#apply"))
+                    self.assertIsInstance(app.screen, ConfirmScreen)
+                    launch.assert_not_called()
+                    self.assertTrue(await pilot.click("#confirm"))
+                    launch.assert_called_once_with(
+                        ["router-dns", "--servers", "192.168.1.17,192.168.1.4", "--apply"], False)
+
+    async def test_router_dns_prefills_detected_addresses_and_retains_manual_edits(self):
+        servers = [{"host": "fly", "address": "192.168.1.4"}, {"host": "naruto", "address": "192.168.1.17"}]
+        with tempfile.TemporaryDirectory() as directory:
+            app = OnboardrrApp(Path(directory) / "inventory.sqlite3")
+            async with app.run_test(size=(100, 36)) as pilot:
+                with patch("onboardrr.tui.discover_dns", return_value={"servers": servers}) as discover:
+                    app.navigate("maintenance", "router-dns")
+                    await app.workers.wait_for_complete()
+                    discover.assert_called_once_with(app.database)
+                argument = app.query_one("#argument", Input)
+                self.assertEqual(argument.value, "192.168.1.4,192.168.1.17")
+                argument.value = "192.168.1.17"
+                with patch("onboardrr.tui.discover_dns", return_value={"servers": []}) as discover:
+                    self.assertTrue(await pilot.click("#detect-dns"))
+                    await app.workers.wait_for_complete()
+                    discover.assert_called_once_with(app.database)
+                self.assertEqual(argument.value, "192.168.1.17")
+
     async def test_usb_format_confirms_the_selected_volume_without_typing_its_path(self):
         alias = "/dev/disk/by-id/usb-fixture-part2"
         with tempfile.TemporaryDirectory() as directory:

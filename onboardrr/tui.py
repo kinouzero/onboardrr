@@ -20,10 +20,11 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
-from textual.widgets import Button, DataTable, Footer, Input, Label, Log, OptionList, ProgressBar, Select, SelectionList, Static, Switch
+from textual.widgets import Button, Checkbox, DataTable, Footer, Input, Label, Log, OptionList, ProgressBar, Select, SelectionList, Static, Switch
 from textual.widgets.option_list import Option
 
 from . import automatic
+from .dns_discovery import discover_dns
 from .inventory import NAS_PROFILE, PROFILE, PROFILES, SERVER_PROFILE, Inventory
 from .primary_storage import storage_endpoint
 from .progress import EVENT_FD
@@ -94,6 +95,8 @@ ACTIONS = {
         automatic.INSTALL[key][0], ("prepare",), "--apply", profiles=automatic.INSTALL[key][1],
     ) for key in automatic.PREPARE_COMPONENTS if key != "docker"},
     "docker": Action(automatic.INSTALL["docker"][0], ("auto-install",), "--apply"),
+    **{key: Action(automatic.INSTALL[key][0], ("install-stack", stack), "--apply", True, automatic.INSTALL[key][1])
+       for key, stack in automatic.PLATFORM_INSTALL.items()},
     "goku": Action(GOKU_LABEL, ("auto-install",), "--apply", True),
     "register": Action(automatic.INSTALL["komodo"][0], ("komodo", "register"), "--apply"),
     "stage": Action("Stage Periphery files on Goku", ("periphery",)),
@@ -114,10 +117,16 @@ ACTIONS = {
     "termix": Action(automatic.INSTALL["termix"][0], ("termix",), "--apply", options="--address … or --remove"),
     "compose": Action("Update Compose files via WUD", ("compose-update",), "--apply", True, PROFILES,
                       "--wud-url …"),
+    "portabase-sync": Action("Sync databases with Portabase", ("portabase-sync",), "--apply", True,
+                             options="--project UUID"),
     "storage-nas": Action("Select the primary storage NAS", ("set-storage-nas",), "--apply",
                           profiles=(NAS_PROFILE,)),
+    "router-dns": Action("Router DHCP DNS", ("router-dns",), "--apply", field="IPv4 DNS servers, comma-separated"),
+    "router-pair": Action("Pair the operator router", ("router-pair",)),
     "wifi": Action(automatic.INSTALL["wifi"][0], ("wifi",), "--apply", profiles=(PROFILE,),
                    options="--interface …"),
+    "wifi-disable": Action("Disable Wi-Fi", ("wifi",), "--apply", profiles=(PROFILE,)),
+    "wifi-sync": Action("Sync host IP and stacks", ("wifi",), "--apply", profiles=(PROFILE,), options="--interface …"),
     "usb-storage": Action(automatic.INSTALL["usb-storage"][0], ("usb-storage",), "--apply", True, (PROFILE,)),
     "unmount-usb": Action("Unmount USB storage", ("usb-storage",), "--apply", True, (PROFILE,)),
     "format-usb": Action("Format USB storage", ("usb-storage",), "--apply", True, (PROFILE,)),
@@ -128,23 +137,27 @@ ACTIONS = {
                                 profiles=LINUX),
     "free": Action("Custom Onboardrr command", ()),
 }
-DEVICELESS = {"free"}
-CONFIRM = {"bootstrap", "stage", "free"}
+ROUTER_ACTIONS = {"router-dns", "router-pair"}
+DEVICELESS = {"free", *ROUTER_ACTIONS}
+CONFIRM = {"bootstrap", "stage", "free", "router-pair"}
 AUTO_ACTIONS = {"auto-install", "auto-uninstall"}
 PREPARATION_ACTIONS = {
     ("prepare" if key == "system" else key): key for key in automatic.PREPARE_COMPONENTS if key != "docker"
 }
 USB_ACTIONS = {"usb-storage", "unmount-usb", "format-usb"}
-SUDO_ACTIONS = {*PREPARATION_ACTIONS, *INSTALL_GROUPS, "wifi", *USB_ACTIONS, *automatic.MONITORING, *AUTO_ACTIONS}
+SUDO_ACTIONS = {*PREPARATION_ACTIONS, *INSTALL_GROUPS, "wifi", "wifi-disable", *USB_ACTIONS,
+                *automatic.MONITORING, *AUTO_ACTIONS, *automatic.PLATFORM_INSTALL}
+SSH_TRUST_ACTIONS = SUDO_ACTIONS | {"wifi-sync"}
 SECTIONS = {
     "dashboard": ("Home", ()),
     "guide": ("Continue", ("open", "preflight", "bootstrap", "wifi", "prepare", "usb-storage", "docker", "bluetooth",
-                          "nvidia", "vnc", "openbao-agent", "register", "goku",
+                          "nvidia", "vnc", "openbao-server", "openbao-agent",
+                          *(key for key in automatic.PLATFORM_INSTALL if key != "openbao-server"), "register", "goku",
                           "periphery-start", "pangolin", *automatic.BASELINE_COMPONENTS, "routes",
                           "verify", *automatic.MONITORING, "termix", "current")),
     "automatic": ("Auto", ("auto-install", "auto-uninstall")),
-    "maintenance": ("Maintenance", ("compose", "storage-nas", "usb-storage", "unmount-usb", "format-usb",
-                                    *automatic.MONITORING, "termix", "routes", "wifi",
+    "maintenance": ("Maintenance", ("compose", "portabase-sync", "storage-nas", "router-dns", "router-pair", "usb-storage", "unmount-usb", "format-usb",
+                                    *automatic.MONITORING, "termix", "routes", "wifi", "wifi-disable", "wifi-sync",
                                     "unregister", "unregister-passkey")),
     "history": ("History", ("current", "history", "open")),
     "advanced": ("CLI", ("free",)),
@@ -155,9 +168,9 @@ GUIDE = {
     "komodo-registration": ("Register the host in Komodo", "register",
                             "Preview to fetch the Komodo version, then apply the registration."),
     "goku-files": (GOKU_LABEL, "goku",
-                   "Stage the files, prepare the export, and mount the SMB and NFS shares."),
+                   "Stage the files, prepare the export, and mount Periphery storage over NFS."),
     "linux": (GOKU_LABEL, "goku",
-              "Resume configuring the SMB and NFS mounts."),
+              "Resume configuring the Periphery NFS mount."),
     "periphery": ("Start and verify Periphery", "periphery-start",
                   "Check the SSH key and mounts, then select Apply to connect the agent to Komodo."),
     "komodo-stacks": ("Deploy baseline stacks", "docker-proxy",
@@ -205,7 +218,11 @@ ACTION_HINTS = {
     "monitoring": "Check registration in Beszel, WUD, Prometheus, and Dozzle.",
     "compose": "Select the files. Preview shows the WUD versions. Apply saves and deploys the updates.",
     "storage-nas": "Select a NAS from the inventory. Preview resolves its address before updating OpenBao.",
+    "router-dns": "Review the detected servers or enter addresses in the order you want DHCP to advertise them.",
+    "router-pair": "Approve Onboardrr on the router display, then enable its settings permission in Freebox OS.",
     "wifi": "Choose a band, then apply over Ethernet.",
+    "wifi-disable": "Verify SSH over Ethernet, then disable Wi-Fi and sync the wired address to OpenBao.",
+    "wifi-sync": "Detect the current address and sync OpenBao and Komodo without changing Wi-Fi or Ethernet settings.",
     "usb-storage": "Select a USB volume and configure automount. Some USB bridges require a reboot first.",
     "unmount-usb": "Select a USB volume to unmount. Its boot configuration stays in place.",
     "format-usb": "Select a volume. Onboardrr unmounts it, erases its data, then mounts it as ext4.",
@@ -226,6 +243,19 @@ def command_args(key, device, options, *, apply=False, argument="", public_key="
         if not extra or extra[0] == "tui" or (extra[0].startswith("-") and extra[0] not in {"-h", "--help"}):
             raise ValueError("Enter an Onboardrr subcommand such as list or verify --help.")
         return extra
+    if key in ROUTER_ACTIONS:
+        if extra:
+            raise ValueError("Use the router maintenance form to change DNS settings.")
+        arguments = list(action.command)
+        if key == "router-pair":
+            return arguments
+        if argument:
+            arguments.extend(("--servers", argument))
+        if apply:
+            if not argument:
+                raise ValueError("Enter the IPv4 DNS servers before applying.")
+            arguments.append("--apply")
+        return arguments
     if not device or device["profile"] not in action.profiles:
         raise ValueError("Select a compatible host.")
     if any(
@@ -272,6 +302,10 @@ def command_args(key, device, options, *, apply=False, argument="", public_key="
         arguments.append("--format")
     if key == "unmount-usb":
         arguments.append("--unmount")
+    if key == "wifi-disable":
+        arguments.append("--disable")
+    if key == "wifi-sync":
+        arguments.append("--sync")
     if key in AUTO_ACTIONS:
         if argument and "--organization" not in flags:
             arguments.extend(("--organization", argument))
@@ -289,7 +323,7 @@ def command_args(key, device, options, *, apply=False, argument="", public_key="
         raise ValueError("Select an SSH public key or enter its path.")
     if public_key and (needs_key or nas_ssh):
         arguments.extend(("--public-key", public_key))
-    if known_hosts and (needs_key or key in SUDO_ACTIONS):
+    if known_hosts and (needs_key or key in SSH_TRUST_ACTIONS):
         arguments.extend(("--known-hosts", known_hosts))
     if key == "preflight":
         arguments.extend(("--use-key", "--ssh-only"))
@@ -652,6 +686,8 @@ class OnboardrrApp(App):
                                      prompt="Wi-Fi band", id="wifi-band")
                         yield Button("Load USB devices", id="load-usb-devices")
                         yield Select([], prompt="Select a USB volume", id="usb-device")
+                        yield Button("Detect DNS servers", id="detect-dns")
+                        yield Static("", id="dns-detection", markup=False)
                         with Vertical(id="command-arguments"):
                             yield Input(id="argument")
                             yield Select([], prompt="Select a NAS from the inventory", id="storage-nas")
@@ -665,6 +701,7 @@ class OnboardrrApp(App):
                                 yield Input(value=configured_key if selected_key == CUSTOM_SSH_KEY else "",
                                             id="public-key", placeholder="Public key path (.pub)")
                             yield Input(value=known_hosts, id="known-hosts", placeholder="known_hosts · SSH default")
+                        yield Checkbox("Delete backups for removed sources", id="portabase-purge")
                         yield Input(id="options", placeholder="CLI options", max_length=4096)
                         yield SudoPasswordField(id="sudo-password", password=True, max_length=MAX_PASSWORD_BYTES,
                                                 placeholder="Host sudo password · optional")
@@ -876,7 +913,7 @@ class OnboardrrApp(App):
                 elif step in {"goku-files", "linux"}:
                     title = "Prepare NAS files"
                     hint = ("Use the local directories on the primary NAS." if device["name"] == self.storage.name else
-                            "Stage files on the primary NAS, then mount Compose over SMB and Periphery over NFS.")
+                            "Stage files on the primary NAS and mount Periphery storage over NFS.")
                 elif step == "periphery":
                     hint = "Check storage access, then apply to connect Periphery to Komodo."
             if step == "komodo-stacks":
@@ -914,7 +951,7 @@ class OnboardrrApp(App):
                 continue
             button = self.query_one(f"#section-{name}", Button)
             button.set_class(name == self.section, "selected")
-            button.disabled = not device and name not in {"dashboard", "advanced"}
+            button.disabled = not device and name not in {"dashboard", "advanced", "maintenance"}
 
         guide = self.section == "guide"
         self.query_one("#checkpoint", Static).display = guide
@@ -929,7 +966,7 @@ class OnboardrrApp(App):
             self.render_wizard()
             return
         default = self.recommended if guide else keys[0]
-        if self.section == "maintenance" and device["profile"] == NAS_PROFILE:
+        if self.section == "maintenance" and device and device["profile"] == NAS_PROFILE:
             default = "wud"
         if action not in keys:
             action = self.selected_action if not reset and self.selected_action in keys else default
@@ -1142,9 +1179,14 @@ class OnboardrrApp(App):
         action_hint.display = bool(hint)
         argument = self.query_one("#argument", Input)
         argument.display = bool(action.field)
-        if argument.placeholder != action.field:
+        field_changed = argument.placeholder != action.field
+        if field_changed:
             argument.value = "zero" if key in {"pangolin", "routes"} else ""
         argument.placeholder = action.field
+        self.query_one("#detect-dns", Button).display = key == "router-dns"
+        self.query_one("#dns-detection", Static).display = key == "router-dns"
+        if key == "router-dns" and field_changed:
+            self.detect_dns()
         self.query_one("#storage-nas", Select).display = key == "storage-nas"
 
         nas_ssh = device and device["profile"] == NAS_PROFILE and (
@@ -1166,6 +1208,10 @@ class OnboardrrApp(App):
             self.query_one(f"#{name}", Input).display = name in fields
         self.query_one("#command-arguments", Vertical).display = available and bool(argument.display or fields)
 
+        purge = self.query_one("#portabase-purge", Checkbox)
+        purge.display = available and key == "portabase-sync"
+        if changed:
+            purge.value = False
         options = self.query_one("#options", Input)
         if changed:
             options.value = ""
@@ -1177,7 +1223,7 @@ class OnboardrrApp(App):
         self.query_one("#ssh-key-fields", Vertical).display = bool(needs_key)
         key_selection = self.query_one("#ssh-key", Select)
         self.query_one("#public-key", Input).display = bool(needs_key and key_selection.value == CUSTOM_SSH_KEY)
-        known_hosts = self.advanced and (needs_key or key in SUDO_ACTIONS)
+        known_hosts = self.advanced and (needs_key or key in SSH_TRUST_ACTIONS)
         self.query_one("#known-hosts", Input).display = known_hosts
         self.query_one("#ssh-fields", Vertical).display = available and bool(needs_key or known_hosts)
         mode = self.query_one("#interactive", Switch)
@@ -1199,6 +1245,7 @@ class OnboardrrApp(App):
             "stage": "Stage files",
             "history": "View history",
             "current": "View run",
+            "router-pair": "Pair router",
         }.get(key, "Preview" if action.apply else "Run")
         apply_button = self.query_one("#apply", Button)
         apply_button.display = bool(action.apply)
@@ -1206,7 +1253,9 @@ class OnboardrrApp(App):
             "preflight": "Verify SSH", "auto-install": "Install selection", "auto-uninstall": "Uninstall selection",
             "compose": "Apply and deploy",
             "storage-nas": "Use this NAS",
+            "router-dns": "Apply DNS servers",
             "usb-storage": "Mount USB volume", "unmount-usb": "Unmount USB volume", "format-usb": "Format as ext4",
+            "wifi-sync": "Sync IP and stacks",
         }.get(key, "Apply")
         advanced_button = self.query_one("#advanced-options", Button)
         advanced_button.display = supports_options and key != "free"
@@ -1229,6 +1278,33 @@ class OnboardrrApp(App):
         if value == CUSTOM_SSH_KEY:
             return self.query_one("#public-key", Input).value.strip()
         return value if isinstance(value, str) else ""
+
+    @on(Button.Pressed, "#detect-dns")
+    def detect_dns(self):
+        button = self.query_one("#detect-dns", Button)
+        if button.disabled:
+            return
+        button.disabled = True
+        self.query_one("#dns-detection", Static).update("Checking inventory hosts for DNS…")
+        self.run_worker(self.load_dns_servers(self.query_one("#argument", Input).value))
+
+    async def load_dns_servers(self, original):
+        button = self.query_one("#detect-dns", Button)
+        status = self.query_one("#dns-detection", Static)
+        argument = self.query_one("#argument", Input)
+        try:
+            servers = (await asyncio.to_thread(discover_dns, self.database))["servers"]
+        except (OSError, ValueError, sqlite3.Error) as error:
+            status.update(f"DNS detection failed · {error}")
+            return
+        finally:
+            button.disabled = False
+        if not servers:
+            status.update("No DNS servers detected on inventory hosts.")
+            return
+        status.update("Detected · " + ", ".join(f"{server['host']} ({server['address']})" for server in servers))
+        if self.selected_action == "router-dns" and argument.value == original:
+            argument.value = ",".join(server["address"] for server in servers)
 
     @on(Button.Pressed, "#load-compose-files")
     def load_compose_files(self):
@@ -1375,6 +1451,11 @@ class OnboardrrApp(App):
                     self.set_form_error("Select a NAS from the list.")
                     return
             flags = {token.partition("=")[0] for token in shlex.split(options)}
+            if key == "portabase-sync":
+                if "--purge-backups" in flags:
+                    raise ValueError("Use the Portabase backup deletion checkbox.")
+                if self.query_one("#portabase-purge", Checkbox).value:
+                    options += " --purge-backups"
             if sudo_secret is not None:
                 encode_password(sudo_secret)
                 if "--ask-become-pass" not in flags:
@@ -1440,7 +1521,8 @@ class OnboardrrApp(App):
             or (key == "auto-install" and apply and "ssh" in selected
                 and (not history or history[0]["next_step"] == "ssh"))
             or (args[0] == "preflight" and "--use-key" not in args)
-            or (args[0] == "wifi" and "--apply" in args and not os.environ.get("ONBOARDRR_BAO_URL"))
+            or (args[0] == "wifi" and not {"--disable", "--sync"}.intersection(args) and "--apply" in args
+                and not os.environ.get("ONBOARDRR_BAO_URL"))
             or ("--ask-become-pass" in args and sudo_secret is None)
         )
         command = shlex.join(["onboardrr", *args])
@@ -1451,6 +1533,11 @@ class OnboardrrApp(App):
             self.push_screen(ConfirmScreen(message, title="Format USB volume?", confirm_label="Format as ext4"),
                              lambda confirmed: self.launch([*args, "--confirm-device", format_target],
                                                            interactive, **launch_options) if confirmed else None)
+        elif apply and key == "portabase-sync" and "--purge-backups" in args:
+            self.push_screen(ConfirmScreen(
+                "Delete the backups of retired databases previously managed by Onboardrr?",
+                title="Delete retired backups?", confirm_label="Delete backups"),
+                lambda confirmed: self.launch(args, interactive, **launch_options) if confirmed else None)
         elif (apply and key != "auto-install") or key in CONFIRM:
             self.push_screen(ConfirmScreen(command),
                              lambda confirmed: self.launch(args, interactive, **launch_options) if confirmed else None)

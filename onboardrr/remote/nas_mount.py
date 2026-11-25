@@ -70,20 +70,23 @@ def mount_shares(config, *, docker=Path("/share/docker")):
             or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", name)
             or any(type(number) is not int or number < 0 for number in (uid, gid))):
         raise ValueError("Invalid NAS mount configuration.")
-    cifs, nfs = config["cifs"], config["nfs"]
-    if (not re.fullmatch(r"//[a-zA-Z0-9.-]+/[a-zA-Z0-9_.-]+", cifs)
-            or not re.fullmatch(r"[a-zA-Z0-9.-]+:/[a-zA-Z0-9_./-]+", nfs)
+    cifs, nfs = config.get("cifs"), config["nfs"]
+    if (not re.fullmatch(r"[a-zA-Z0-9.-]+:/[a-zA-Z0-9_./-]+", nfs)
             or ".." in nfs.split("/")):
-        raise ValueError("Invalid SMB or NFS source for QTS.")
-    user, password = config["username"], config["password"]
-    if not all(isinstance(value, str) and value and not any(char in value for char in "\r\n\0")
-               for value in (user, password)):
-        raise ValueError("Invalid SMB credentials.")
+        raise ValueError("Invalid NFS source for QTS.")
     compose = home / ".docker/compose"
     data = docker / "komodo" / "data" / name
     target_directory(compose, home, owner=(uid, gid))
     target_directory(data, docker)
-    entries = [(compose, cifs, {"cifs", "smb3"}), (data, nfs, {"nfs", "nfs4"})]
+    entries = [(data, nfs, {"nfs", "nfs4"})]
+    if cifs is not None:
+        if not re.fullmatch(r"//[a-zA-Z0-9.-]+/[a-zA-Z0-9_.-]+", cifs):
+            raise ValueError("Invalid SMB source for QTS.")
+        user, password = config["username"], config["password"]
+        if not all(isinstance(value, str) and value and not any(char in value for char in "\r\n\0")
+                   for value in (user, password)):
+            raise ValueError("Invalid SMB credentials.")
+        entries.insert(0, (compose, cifs, {"cifs", "smb3"}))
     pending = []
     current = mount_table()
     for target, source, types in entries:

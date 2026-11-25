@@ -13,6 +13,7 @@ CONTROLLER_SETTINGS = {
     "openbao_token_file": "ONBOARDRR_BAO_TOKEN_FILE",
     "periphery_retire_token_file": "ONBOARDRR_BAO_PERIPHERY_RETIRE_TOKEN_FILE",
     "komodo_url": "ONBOARDRR_KOMODO_URL",
+    "komodo_core_device": "ONBOARDRR_KOMODO_CORE_DEVICE",
     "komodo_openbao_token_file": "ONBOARDRR_KOMODO_BAO_TOKEN_FILE",
     "newt_openbao_mount": "ONBOARDRR_NEWT_BAO_MOUNT",
     "pangolin_url": "ONBOARDRR_PANGOLIN_URL",
@@ -24,6 +25,12 @@ CONTROLLER_SETTINGS = {
     "beszel_url": "ONBOARDRR_BESZEL_URL",
     "wud_url": "ONBOARDRR_WUD_URL",
     "termix_url": "ONBOARDRR_TERMIX_URL",
+    "portabase_url": "ONBOARDRR_PORTABASE_URL",
+    "portabase_project_id": "ONBOARDRR_PORTABASE_PROJECT_ID",
+    "portabase_policy_project": "ONBOARDRR_PORTABASE_POLICY_PROJECT",
+    "portabase_api_token_file": "ONBOARDRR_PORTABASE_API_TOKEN_FILE",
+    "router_provider": "ONBOARDRR_ROUTER_PROVIDER",
+    "router_url": "ONBOARDRR_ROUTER_URL",
 }
 
 

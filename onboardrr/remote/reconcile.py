@@ -8,6 +8,7 @@ import re
 import subprocess
 import sys
 from base64 import b64encode
+from ipaddress import ip_address
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
@@ -75,10 +76,25 @@ def check_nas_mounts(request, data):
         source, target, kind, *_ = line.split()
         target = re.sub(r"\\([0-7]{3})", lambda match: chr(int(match[1], 8)), target)
         mounted[target] = (source, kind)
-    for path, key, types in ((compose, "cifs_source", {"cifs", "smb3"}), (data, "nfs_source", {"nfs", "nfs4"})):
-        source, kind = mounted.get(str(path.resolve()), (None, None))
-        if kind not in types or source != request.get(key):
-            raise ValueError(f"Mount the primary NAS share at {path} before starting Periphery.")
+    source, kind = mounted.get(str(data.resolve()), (None, None))
+    if kind not in {"nfs", "nfs4"} or source != request.get("nfs_source"):
+        raise ValueError(f"Mount the primary NAS share at {data} before starting Periphery.")
+
+
+def periphery_labels(name, core_url, docker_endpoint=None, *, kuma_local=False):
+    labels = {
+        "docker.stack": "komodo", "komodo.skip": "",
+        "homepage.href": core_url, "homepage.group": f"Docker {name}",
+        "homepage.icon": "sh-komodo", "homepage.name": "komodo-agent",
+        "wud.display.icon": "sh-komodo", "wud.display.name": "komodo-agent",
+        "wud.link.template": "https://github.com/moghtech/komodo/releases",
+        "wud.tag.include": r"^\d+\.\d+\.\d+$$",
+    }
+    if kuma_local:
+        labels["kuma.__docker"] = f'"{name}", "socket", "/var/run/docker.sock"'
+    elif docker_endpoint:
+        labels["kuma.__docker"] = f'"{name}", "tcp", "{docker_endpoint}"'
+    return labels
 
 
 def recover_outbound(request):
@@ -105,18 +121,20 @@ def recover_outbound(request):
                 "type": "nfs", "o": f"addr={host},nfsvers=4,rw", "device": f":/{export}",
             }}}
     else:
-        mounts = [(compose_mount, request["cifs_source"], "cifs"), (data, request["nfs_source"], "nfs4")]
-        if not all(mount_matches(path, source, fs, extra) for path, source, fs in mounts for extra in ((), ("--fstab",))):
-            raise ValueError("The expected Goku mounts must be active and persistent.")
-        verify_linux_reference(compose_mount, name, request.get("bootstrap", False))
+        if not all(mount_matches(data, request["nfs_source"], "nfs4", extra) for extra in ((), ("--fstab",))):
+            raise ValueError("The expected Periphery NFS mount must be active and persistent.")
     output("docker", "version", "--format", "{{.Server.Version}}")
     output("docker", "compose", "version", "--short")
 
     root = home / ".config" / "onboardrr" / "periphery"
     keys = root / "keys"
-    private_key, compose = keys / "periphery.key", root / "compose.yaml"
+    private_key = keys / "periphery.key"
+    project_directory = compose_mount
+    compose = project_directory / "compose.komodo.yml"
     if not all(operator_directory(path) for path in (home / ".config", root.parent, root, keys)):
         raise ValueError("The local Periphery directory is unsafe.")
+    if not operator_directory(project_directory) and not (nas and request["local_storage"]):
+        raise ValueError("The local Periphery Compose directory is unsafe.")
     for path in (private_key, compose):
         if path.is_symlink() or (path.exists() and (not path.is_file() or path.stat().st_uid != os.getuid()
                                                    or path.stat().st_mode & 0o077)):
@@ -133,7 +151,9 @@ def recover_outbound(request):
         "name": "komodo",
         "services": {"komodo-agent": {
             "image": image, "container_name": "komodo-agent", "init": True, "restart": "unless-stopped",
-            "environment": agent_environment, "labels": {"komodo.skip": "", "docker.stack": "komodo"},
+            "environment": agent_environment,
+            "labels": periphery_labels(name, request["core_url"], request.get("docker_endpoint"),
+                                       kuma_local=request.get("kuma_local", False)),
             "volumes": [f"{keys}:/config/keys", data_mount, "/var/run/docker.sock:/var/run/docker.sock",
                         "/etc/localtime:/etc/localtime:ro", "/proc:/proc"],
         }},
@@ -141,17 +161,30 @@ def recover_outbound(request):
     }
     if volumes:
         configuration["volumes"] = volumes
-    if compose.exists() and (compose.stat().st_size > 1048576 or json.loads(compose.read_text()) != configuration):
-        raise ValueError("The existing local Periphery Compose configuration differs from the expected setup.")
+    current_labels = None
+    if compose.exists():
+        existing = json.loads(compose.read_text()) if compose.stat().st_size <= 1048576 else {}
+        existing_service = existing.get("services", {}).get("komodo-agent", {})
+        expected_labels = configuration["services"]["komodo-agent"]["labels"]
+        current_labels = existing_service.get("labels", {})
+        existing_service["labels"] = expected_labels
+        if "dns" in existing_service:
+            dns = existing_service["dns"]
+            if not isinstance(dns, list) or not dns or not all(isinstance(address, str) and ip_address(address) for address in dns):
+                raise ValueError("The existing Periphery Compose DNS settings are invalid.")
+            configuration["services"]["komodo-agent"]["dns"] = dns
+        if existing != configuration or not isinstance(current_labels, dict):
+            raise ValueError("The existing local Periphery Compose configuration differs from the expected setup.")
 
     containers = output("docker", "ps", "-aq", "--filter", "name=^/komodo-agent$").split()
     running = False
     if containers:
         labels = json.loads(output("docker", "inspect", "--format", "{{json .Config.Labels}}", *containers))
+        recorded_path = labels.get("com.docker.compose.project.config_files")
         if (not compose.is_file() or not private_key.is_file()
                 or labels.get("com.docker.compose.project") != "komodo"
                 or labels.get("com.docker.compose.service") != "komodo-agent"
-                or labels.get("com.docker.compose.project.config_files") != str(compose)
+                or recorded_path != str(compose)
                 or output("docker", "inspect", "--format", "{{.Config.Image}}", containers[0]) != image
                 or json.loads(output("docker", "inspect", "--format", "{{json .HostConfig.PortBindings}}", containers[0]))):
             raise ValueError("An existing container does not match the expected outbound Periphery deployment.")
@@ -176,7 +209,20 @@ def recover_outbound(request):
             generated = subprocess.check_output(["openssl", "genpkey", "-algorithm", "X25519"], timeout=8)
             write_once(private_key, generated)
         if not compose.exists():
+            project_directory.mkdir(parents=True, mode=0o700, exist_ok=True)
             write_once(compose, json.dumps(configuration, indent=2).encode() + b"\n")
+        elif current_labels.get("kuma.__docker") != expected_labels.get("kuma.__docker"):
+            if "kuma.__docker" in expected_labels:
+                current_labels["kuma.__docker"] = expected_labels["kuma.__docker"]
+            existing_service["labels"] = current_labels
+            with NamedTemporaryFile(dir=project_directory, delete=False) as temporary:
+                pending = Path(temporary.name)
+                try:
+                    temporary.write(json.dumps(existing, indent=2).encode() + b"\n")
+                    temporary.flush()
+                    pending.replace(compose)
+                finally:
+                    pending.unlink(missing_ok=True)
         if network_id is None:
             network_id = output("docker", "network", "create", "--driver", "bridge",
                                 "--label", f'onboardrr.device-id={request["device_id"]}', name)
@@ -202,27 +248,10 @@ def recover_outbound(request):
             "owned_network": owned_network}
 
 
-def verify_linux_reference(compose_mount, name, bootstrap):
-    share = compose_mount / name
-    source = share / "docker-compose.komodo.yml"
-    legacy_environment = share / ".env"
-    use_template = bootstrap or (not legacy_environment.exists() and not legacy_environment.is_symlink())
-    environment = share / "template.env" if use_template else legacy_environment
-    if (share.is_symlink() or any(file.is_symlink() or not file.is_file() or file.stat().st_size > 1048576
-                                  for file in (source, environment))
-            or not re.search(r"(?m)^  komodo-agent:\s*$", source.read_text())):
-        raise ValueError("The Goku Compose reference or device identity is invalid.")
-    environment_text = environment.read_text()
-    hostnames = re.findall(r"(?m)^(?:DOCKER_)?HOSTNAME=(.*)$", environment_text)
-    if ([value.strip().strip("'\"") for value in hostnames] != [name]
-            or (use_template and "{{_KOMODO_SECRETS}}" not in environment_text)):
-        raise ValueError("The Goku Compose reference or device identity is invalid.")
-
-
 def inspect(request):
     name = request["device"]
     compose_mount = Path.home() / ".docker" / "compose"
-    compose = compose_mount / name / "docker-compose.komodo.yml"
+    compose = compose_mount / "compose.komodo.yml"
     if request["periphery"]:
         if request.get("nas") is True:
             check_nas_mounts(request, nas_storage(request))
@@ -234,18 +263,15 @@ def inspect(request):
             "docker", "inspect", "--format",
             '{{index .Config.Labels "com.docker.compose.project.config_files"}}', ids[0],
         )
-        local = Path.home() / ".config" / "onboardrr" / "periphery" / "compose.yaml"
-        return {"ready": any(str(path) in files.split(",") for path in (compose, local))}
+        return {"ready": str(compose) in files.split(",")}
     if request.get("nas") is True:
         check_nas_mounts(request, nas_storage(request))
         ready = bool(output("docker", "version", "--format", "{{.Server.Version}}")
                      and output("docker", "compose", "version", "--short"))
         return {"ready": ready}
     data_mount = Path("/share/docker/komodo/data") / name
-    mounts = [(compose_mount, request["cifs_source"], "cifs"), (data_mount, request["nfs_source"], "nfs4")]
     ready = all(
-        mount_matches(path, source, fstype, extra)
-        for path, source, fstype in mounts for extra in ((), ("--fstab",))
+        mount_matches(data_mount, request["nfs_source"], "nfs4", extra) for extra in ((), ("--fstab",))
     )
     if request.get("mounts_only"):
         return {"ready": ready, "compose_mount": str(compose_mount)}

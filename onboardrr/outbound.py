@@ -9,6 +9,7 @@ from urllib.parse import urlsplit
 
 from .inventory import NAS_PROFILE
 from .komodo import MONGO_ID, REGISTRATION_STEP
+from .kuma import kuma_on_host, kuma_tcp_values
 from .primary_storage import storage_endpoint
 from .runs import Ownership, Resource, ResourceKind
 from .storage import device_lock
@@ -51,7 +52,7 @@ def advance_recovery(runs, run, server_id, name, compose_mount, network_id=None,
         "goku-files": [(ResourceKind.GOKU_DIRECTORY, compose_path), (ResourceKind.GOKU_DIRECTORY, data_path),
                        (ResourceKind.GOKU_FILE, f"{compose_path}/docker-compose.komodo.yml"),
                        (ResourceKind.GOKU_FILE, f"{compose_path}/.env")],
-        "linux": [] if nas else [(ResourceKind.MOUNT, compose_mount), (ResourceKind.MOUNT, data_path),
+        "linux": [] if nas else [(ResourceKind.MOUNT, data_path),
                                  (ResourceKind.DOCKER_NETWORK, network_reference)],
         "periphery": [(ResourceKind.DOCKER_NETWORK, network_reference)] if nas and owned_network else [],
     }
@@ -73,8 +74,8 @@ def recover_outbound(device, runs, komodo, *, known_hosts, public_key, cifs_sour
     from . import ssh
 
     nas = device["profile"] == NAS_PROFILE
-    if not nas and not cifs_source:
-        raise ValueError("Provide the expected Goku SMB mount source.")
+    if not nas and not nfs_source:
+        raise ValueError("Provide the expected Periphery NFS mount source.")
     core_version = komodo.version() if bootstrap or expected_version else None
     if bootstrap and expected_version is None:
         expected_version = core_version
@@ -115,7 +116,7 @@ def recover_outbound(device, runs, komodo, *, known_hosts, public_key, cifs_sour
             authority += f":{komodo.service.port}"
         payload = {"device": name, "device_id": device["id"], "version": expected_version,
                    "core_url": f"https://{authority}",
-                   "core_public_key": core_key, "cifs_source": cifs_source, "nfs_source": nfs_source,
+                   "core_public_key": core_key, "nfs_source": nfs_source,
                    "bootstrap": bootstrap}
         if nas:
             if run["next_step"] in {REGISTRATION_STEP, "nas-prepare", "goku-files", "linux"}:
@@ -155,6 +156,10 @@ def recover_outbound(device, runs, komodo, *, known_hosts, public_key, cifs_sour
                 ).get("status") != "NotOk":
                     raise ValueError("Replace the agent key only when the existing Komodo server is offline.")
                 if bootstrap or not observed["running"] or needs_replacement:
+                    payload["kuma_local"] = kuma_on_host(client, entware=nas)
+                    if not payload["kuma_local"]:
+                        values = kuma_tcp_values(device)
+                        payload["docker_endpoint"] = f"http://{values['HOST_IP']}:{values['DOCKER_API_PORT']}"
                     prepared = remote("stage")
                     observed = prepared
                     local_key = x25519_key(prepared["public_key"])

@@ -17,6 +17,11 @@ from tempfile import NamedTemporaryFile
 PROJECT = re.compile(r"[a-z0-9][a-z0-9_-]*")
 TAG = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}")
 COMPOSE_FILENAME = re.compile(r"(?:docker-)?compose(?:[.-][^.]+)*\.ya?ml|[^.]+-compose\.ya?ml")
+KOMODO_DOCUMENTDB = "komodo-postgres"
+KOMODO_FERRETDB = "komodo-ferretdb"
+KOMODO_DATABASE_SERVICES = (KOMODO_DOCUMENTDB, KOMODO_FERRETDB)
+DOCUMENTDB_IMAGE = re.compile(r"ghcr\.io/ferretdb/postgres-documentdb:(\d+)-(\d+\.\d+\.\d+)-ferretdb-(2\.\d+\.\d+)")
+FERRETDB_IMAGE = re.compile(r"ghcr\.io/ferretdb/ferretdb:(2\.\d+\.\d+)")
 DOCKER_CLI = "docker"
 COMPOSE_CLI = None
 NAS_DOCKER = False
@@ -33,6 +38,7 @@ def docker_environment():
         environment.pop(name, None)
     if NAS_DOCKER:
         environment["DOCKER_HOST"] = "unix:///var/run/docker.sock"
+        environment.setdefault("DOCKER_CONFIG", str(Path.home() / ".docker"))
     environment["COMPOSE_REMOVE_ORPHANS"] = "false"
     return environment
 
@@ -130,6 +136,25 @@ def dcu_project_name(compose, env_files, directory, *, interpolate):
     return project
 
 
+def named_compose_file(directory, name):
+    if not PROJECT.fullmatch(name):
+        return None
+    file = directory / f"compose.{name}.yml"
+    return file if file.is_file() else None
+
+
+def installed_periphery_source(canonical):
+    rows = inspect_compose_containers("komodo", running_only=False)
+    if not rows or any(service != "komodo-agent" or not files or Path(files).resolve() != canonical
+                       for _, _, service, _, files, _ in rows):
+        return None
+    groups = group_sources("komodo", rows, *source_environment())
+    if len(groups) != 1:
+        raise ValueError("The installed Komodo agent has conflicting Compose sources.")
+    (_, _, environment), = groups
+    return canonical.parent, (str(canonical),), environment
+
+
 def dcu_command(arguments, directory):
     parser = argparse.ArgumentParser(
         prog="dcu", description="Start the local Compose project with its OpenBao Agent environment.",
@@ -140,7 +165,27 @@ def dcu_command(arguments, directory):
     parser.add_argument("--project-directory")
     parser.add_argument("--env-file", action="append", default=[])
     parser.add_argument("--profile", action="append", default=[])
+    parser.add_argument("--dry-run", action="store_true")
     options, up_options = parser.parse_known_args(arguments)
+    named_project = None
+    installed_source = None
+    default_directory = directory / options.project_directory if options.project_directory else directory
+    if up_options and not options.file:
+        name = up_options[0]
+        file = named_compose_file(default_directory, name)
+        if (name == "komodo" and file and options.project_name in (None, name) and not options.project_directory
+                and default_directory.resolve() == (Path.home() / ".docker/compose").resolve()):
+            installed_source = installed_periphery_source(file.resolve())
+        if installed_source or file:
+            named_project = up_options.pop(0)
+            if installed_source:
+                source_directory, files, environment = installed_source
+                options.project_directory = str(source_directory)
+                options.file = list(files)
+                options.env_file = options.env_file or list(environment)
+            else:
+                options.file.append(str(file.resolve()))
+
     compose = ["compose"]
     if options.project_directory:
         compose.extend(["--project-directory", options.project_directory])
@@ -150,9 +195,16 @@ def dcu_command(arguments, directory):
         compose.extend(["--profile", profile])
 
     env_files = options.env_file
-    project = options.project_name
+    project = options.project_name or ("secrets" if named_project == "openbao" else named_project)
     nas_cache = Path.home() / ".config/docker/openbao/compose/cache"
-    if os.path.lexists(AGENT_STATE / "compose-agent-projects.json") or (NAS_DOCKER and nas_cache.is_dir()):
+    if named_project == "openbao" and not env_files:
+        agent_env = Path.home() / ".config/docker/openbao/compose.env"
+        if not os.path.lexists(agent_env):
+            agent_env = Path.home() / ".config/docker/compose-openbao/agent-compose.env"
+        verify_rendered_environment(agent_env, os.getuid(), 0o600)
+        env_files = [str(agent_env)]
+    if named_project != "openbao" and not installed_source and (os.path.lexists(AGENT_STATE / "compose-agent-projects.json")
+                                 or (NAS_DOCKER and nas_cache.is_dir())):
         if not project:
             if "-" in options.file:
                 raise ValueError("Specify --project-name when reading the Compose file from stdin.")
@@ -165,15 +217,27 @@ def dcu_command(arguments, directory):
                 default_directory = directory / options.project_directory
             elif options.file and options.file[0] != "-":
                 default_directory = (directory / options.file[0]).parent
+        if named_project:
+            env_files = agent_environment("config", default_directory, env_files)
+            platform_env = Path.home() / ".config/onboardrr/platform" / f"{named_project}.env"
+            if named_project in {"authentik", "komodo", "pangolin"} and os.path.lexists(platform_env):
+                verify_rendered_environment(platform_env, os.getuid(), 0o600)
+                env_files = agent_environment(platform.node().lower(), default_directory, env_files)
+            elif named_project == "komodo":
+                env_files = agent_environment("periphery", default_directory, env_files)
         env_files = agent_environment(project, default_directory, env_files)
-        if not options.project_name and env_files != options.env_file:
+        if named_project and named_project in {"authentik", "komodo", "pangolin"} and os.path.lexists(platform_env):
+            env_files = [*env_files, str(platform_env)]
+        if not (options.project_name or named_project) and env_files != options.env_file:
             if dcu_project_name(compose, env_files, directory, interpolate=True) != project:
                 raise ValueError("The OpenBao environment changed the Compose project name. Use dcu --project-name NAME.")
 
-    if options.project_name or env_files != options.env_file:
+    if options.project_name or named_project or env_files != options.env_file:
         compose.extend(["--project-name", project])
     for path in env_files:
         compose.extend(["--env-file", path])
+    if options.dry_run:
+        compose.insert(1, "--dry-run")
     return [*compose, "up", "--detach", *up_options]
 
 
@@ -308,6 +372,49 @@ def tag_reference(image, tag):
     return f"{repository}:{tag}"
 
 
+def komodo_database_images(images):
+    pair = {name: images.get(name, "") for name in KOMODO_DATABASE_SERVICES}
+    if any(image.startswith("ghcr.io/ferretdb/") for image in pair.values()):
+        return pair
+    return {}
+
+
+def validate_komodo_database_update(current, desired):
+    postgres = DOCUMENTDB_IMAGE.fullmatch(desired[KOMODO_DOCUMENTDB])
+    ferret = FERRETDB_IMAGE.fullmatch(desired[KOMODO_FERRETDB])
+    if not postgres or not ferret or postgres[3] != ferret[1]:
+        raise ValueError("Wait for matching DocumentDB and FerretDB release tags before updating Komodo.")
+    previous = DOCUMENTDB_IMAGE.fullmatch(current[KOMODO_DOCUMENTDB])
+    if not previous or postgres[1] != previous[1]:
+        raise ValueError("A PostgreSQL major upgrade requires a separate migration.")
+    previous_ferret = FERRETDB_IMAGE.fullmatch(current[KOMODO_FERRETDB])
+    if not previous_ferret:
+        raise ValueError("The running FerretDB version must be a pinned release.")
+    extensions = [tuple(map(int, tag.split("."))) for tag in (postgres[2], previous[2])]
+    ferrets = [tuple(map(int, tag.split("."))) for tag in (ferret[1], previous_ferret[1])]
+    if extensions[0] < extensions[1] or ferrets[0] < ferrets[1]:
+        raise ValueError("A Komodo database downgrade requires a separate recovery.")
+
+
+def komodo_database_checkpoint(directory):
+    return directory / ".onboardrr-komodo-database-update.json"
+
+
+def read_komodo_database_checkpoint(directory):
+    path = komodo_database_checkpoint(directory)
+    if path.is_symlink():
+        raise ValueError("The Komodo database update checkpoint is a symlink.")
+    if not path.exists():
+        return {}
+    pair = json.loads(path.read_text())
+    if not isinstance(pair, dict) or set(pair) != set(KOMODO_DATABASE_SERVICES) or not all(
+        isinstance(image, str) for image in pair.values()
+    ):
+        raise ValueError("Invalid Komodo database update checkpoint.")
+    validate_komodo_database_update(pair, pair)
+    return pair
+
+
 def read_pins(override, project):
     if override.is_symlink():
         raise ValueError("The reserved Compose override path is a symlink.")
@@ -347,6 +454,8 @@ def publish(path, content):
 def update_source(project, source, versions, *, targeted, files_only):
     directory, override, command, images, pins = source
     current = {**images, **pins}
+    if project == "komodo" and komodo_database_images(current) and versions.keys() & set(KOMODO_DATABASE_SERVICES):
+        raise ValueError("Select compose.komodo.yml with Update Compose files via WUD for ordered database updates.")
     for name, tag in versions.items():
         pins[name] = tag_reference(current[name], tag)
     targets = ["--", *sorted(versions)] if targeted else []
@@ -423,6 +532,10 @@ def update(request):
     versions = request.get("versions", {})
     if not versions.keys() <= current.keys():
         raise ValueError("A selected service has no configured registry image.")
+    if project == "komodo" and not use_wud and (pair := komodo_database_images(current)):
+        if any(container["service"] in pair and container["image"] != pair[container["service"]]
+               for container in containers):
+            raise ValueError("Select compose.komodo.yml with Update Compose files via WUD for ordered database updates.")
     if len({source[1] for _, source in sources}) != len(sources):
         raise ValueError("Independent Compose sources must use separate image overrides.")
     overrides = []
@@ -466,26 +579,16 @@ def configure_nas_launcher():
 def compose_workspace(host):
     if not isinstance(host, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", host):
         raise ValueError("Invalid host name for the Compose workspace.")
-    home = Path.home()
-    primary = home / ".docker/compose"
-    alternate = home / ".config/docker/compose"
-    for directory in (primary / host, alternate / host):
-        if directory.is_dir():
-            return directory.resolve(strict=True)
-    workspaces = [directory for directory in (primary, alternate) if directory.is_dir()]
-    for directory in workspaces:
-        if any(directory.iterdir()):
-            return directory.resolve(strict=True)
-    if workspaces:
-        return workspaces[0].resolve(strict=True)
-    raise ValueError("The default Compose workspace is unavailable on this host.")
+    workspace = Path.home() / ".docker/compose"
+    if not workspace.is_dir():
+        raise ValueError("The Compose workspace ~/.docker/compose is unavailable on this host.")
+    return workspace.resolve(strict=True)
 
 
 def compose_file(directory, name):
     path = Path(name)
-    if (path.is_absolute() or ".." in path.parts or not COMPOSE_FILENAME.fullmatch(path.name)
-            or any(part.startswith(".") for part in path.parts)):
-        raise ValueError("Select Compose files within the host's workspace.")
+    if path.is_absolute() or len(path.parts) != 1 or not COMPOSE_FILENAME.fullmatch(path.name):
+        raise ValueError("Select a Compose file directly in the host's workspace.")
     entry = directory / path
     if entry.resolve(strict=True) != entry or not entry.is_file():
         raise ValueError("Select a regular Compose file within the host's workspace.")
@@ -494,22 +597,41 @@ def compose_file(directory, name):
 
 def deployment_plan(originals, deployment):
     by_path = {originals[name][0]: images for name, images in deployment["images"].items()}
+    projects = {"openbao": "secrets", "komodo": "komodo", "authentik": "authentik", "pangolin": "pangolin"}
+    canonical = {projects[name]: path for path in by_path
+                 if (match := re.fullmatch(r"compose\.([a-z0-9-]+)\.yml", path.name))
+                 and (name := match[1]) in projects}
     pending = {(originals[name][0], service) for name, services in deployment["updated"].items()
                for service in services}
+    komodo = canonical.get("komodo")
+    checkpoint = read_komodo_database_checkpoint(komodo.parent) if komodo else {}
+    if checkpoint and any(by_path[komodo].get(name) != image for name, image in checkpoint.items()):
+        raise ValueError("Resume the saved Komodo database update before changing either image tag again.")
     matched = set()
     watched = {}
     for identifier, old, new in deployment["wud_tags"]:
         watched.setdefault((identifier, old), set()).add(new)
     by_project = {}
     affected = set()
-    for *row, project in inspect_compose_containers(running_only=True):
+    rows = inspect_compose_containers(running_only=True)
+    if checkpoint:
+        running = {row[2] for row in rows if row[-1] == "komodo"}
+        missing = set(checkpoint) - running
+        rows.extend([*row, "komodo"] for row in inspect_compose_containers("komodo", running_only=False)
+                    if row[2] in missing)
+    for *row, project in rows:
         if not isinstance(project, str) or not PROJECT.fullmatch(project):
             continue
+        target = canonical.get(project)
+        if target is not None and row[2] in by_path[target]:
+            row[3:5] = [str(target.parent), str(target)]
         by_project.setdefault(project, []).append(row)
         files = (row[4] or "").split(",")
         if any(Path(file).is_absolute() and Path(file).resolve() in by_path for file in files):
             affected.add(project)
     if not affected and not pending:
+        if checkpoint:
+            raise ValueError("The saved Komodo database upgrade has no matching Compose containers.")
         return []
     sources = source_environment()
     plan = []
@@ -534,10 +656,20 @@ def deployment_plan(originals, deployment):
                     changed = (path, service) in pending
                     if changed:
                         matched.add((path, service))
-                    if changed or pending_wud_upgrade(container["id"], running, desired, watched):
+                    if changed or (path == komodo and service in checkpoint) or pending_wud_upgrade(
+                        container["id"], running, desired, watched
+                    ):
                         if targets.setdefault(service, desired) != desired:
                             raise ValueError(f"Selected Compose files disagree on {project}/{service}.")
             if targets:
+                if project == "komodo" and targets.keys() & set(KOMODO_DATABASE_SERVICES):
+                    current = komodo_database_images({item["service"]: item["image"] for item in group["containers"]})
+                    if current:
+                        desired = komodo_database_images(by_path.get(komodo, {}))
+                        if not desired or not all(current.values()):
+                            raise ValueError("Select the running Komodo Compose file that defines both database services.")
+                        validate_komodo_database_update(current, desired)
+                        targets.update(desired)
                 if ambiguous := sorted(name for name in targets if len(service_sources[name]) > 1):
                     raise ValueError(f"Running instances of {project}/{ambiguous[0]} use different Compose files.")
                 command = source_command(project, key)
@@ -549,6 +681,9 @@ def deployment_plan(originals, deployment):
     if missing := sorted(pending - matched):
         path, service = missing[0]
         raise ValueError(f"No running local Compose service matches {path.name}/{service}.")
+    if checkpoint and not any(project == "komodo" and targets.keys() >= checkpoint.keys()
+                              for project, _, _, targets in plan):
+        raise ValueError("The saved Komodo database upgrade has no matching Compose containers.")
     return plan
 
 
@@ -558,6 +693,47 @@ def pending_wud_upgrade(identifier, running, desired, watched):
         return False
     candidates = watched.get((identifier, tag), set())
     return len(candidates) == 1 and tag_reference(running, next(iter(candidates))) == desired
+
+
+def wait_for_services(command, directory, services):
+    docker(command + ["up", "--detach", "--pull", "never", "--no-build", "--wait", "--wait-timeout", "120",
+                      "--no-deps", "--", *services],
+           "Compose deployment and health verification", directory=directory, timeout=240)
+
+
+def deploy_komodo_database(command, directory, pair):
+    checkpoint = komodo_database_checkpoint(directory)
+    existing = read_komodo_database_checkpoint(directory)
+    if existing and existing != pair:
+        raise ValueError("A different Komodo database upgrade must be resumed first.")
+    publish(checkpoint, json.dumps(pair) + "\n")
+    docker(command + ["stop", "--", "komodo", KOMODO_FERRETDB], "pause Komodo database clients",
+           directory=directory, timeout=120)
+    wait_for_services(command, directory, [KOMODO_DOCUMENTDB])
+    sql = """
+BEGIN;
+ALTER EXTENSION documentdb UPDATE;
+DO $verify$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_available_extensions
+        WHERE name = 'documentdb' AND installed_version = default_version) THEN
+        RAISE EXCEPTION 'DocumentDB extension does not match the image default';
+    END IF;
+    IF NOT string_to_array(replace(current_setting('shared_preload_libraries'), ' ', ''), ',')
+        @> ARRAY['pg_cron', 'pg_documentdb_core', 'pg_documentdb']
+        OR current_setting('cron.database_name', true) IS DISTINCT FROM current_database() THEN
+        RAISE EXCEPTION 'DocumentDB preload libraries or pg_cron database need review';
+    END IF;
+END
+$verify$;
+COMMIT;
+"""
+    docker(command + ["exec", "-T", KOMODO_DOCUMENTDB, "sh", "-ec",
+                      'exec psql -Xw -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d postgres'],
+           "DocumentDB extension upgrade and verification", directory=directory, payload=sql, timeout=240)
+    wait_for_services(command, directory, [KOMODO_FERRETDB])
+    wait_for_services(command, directory, ["komodo"])
+    checkpoint.unlink()
 
 
 def deploy_selected(plan):
@@ -573,9 +749,12 @@ def deploy_selected(plan):
             effective = configured_images(command, directory, include_profiles=True)
             if any(effective.get(name) != targets[name] for name in selected):
                 raise ValueError("The selected Compose images changed during the pull. Run a new preview.")
-            docker(command + ["up", "--detach", "--pull", "never", "--no-build", "--wait", "--wait-timeout", "120",
-                              "--no-deps", "--", *selected],
-                   "Compose deployment and health verification", directory=directory, timeout=240)
+            pair = komodo_database_images(targets) if project == "komodo" else {}
+            if pair:
+                deploy_komodo_database(command, directory, pair)
+                selected = [name for name in selected if name not in (*pair, "komodo")]
+            if selected:
+                wait_for_services(command, directory, selected)
         except ValueError as error:
             result.update(status="failed", error=str(error))
         else:
@@ -589,15 +768,10 @@ def compose_files(request):
     if request.get("workspace") not in (None, str(directory)):
         raise ValueError("The default Compose workspace changed. Reload the file list.")
     if request["action"] == "list-files":
-        files = []
-        for root, folders, names in os.walk(directory):
-            parent = Path(root)
-            folders[:] = sorted(name for name in folders if not name.startswith(".") and not (parent / name).is_symlink())
-            for name in sorted(names):
-                path = parent / name
-                if COMPOSE_FILENAME.fullmatch(name) and not path.is_symlink() and path.is_file():
-                    files.append(str(path.relative_to(directory)))
-        return {"workspace": str(directory), "files": sorted(files)}
+        return {"workspace": str(directory), "files": sorted(
+            path.name for path in directory.iterdir()
+            if COMPOSE_FILENAME.fullmatch(path.name) and not path.is_symlink() and path.is_file()
+        )}
 
     selected = request["files"]
     if not isinstance(selected, list) or not 1 <= len(selected) <= 100 or len(set(selected)) != len(selected):
@@ -616,7 +790,10 @@ def compose_files(request):
     if request["action"] == "read-files":
         return {
             "workspace": str(directory), "architecture": platform.machine(),
-            "files": {name: {"text": original.decode("utf-8"), "digest": digest}
+            "files": {name: {"text": original.decode("utf-8"), "digest": digest, **(
+                {"resume_database": True} if name == "compose.komodo.yml"
+                and read_komodo_database_checkpoint(directory) else {}
+            )}
                       for name, (_, original, digest) in originals.items()},
         }
     if request["action"] != "write-files":

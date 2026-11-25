@@ -51,8 +51,8 @@ def host_resources(device, known_hosts, public_key, cifs_source, nfs_source, *, 
     from . import ssh
 
     nas = device["profile"] == NAS_PROFILE
-    if not public_key or (stage == "linux" and not nas and not (cifs_source and nfs_source)):
-        raise ValueError("Provide an enrolled SSH key and the expected Goku mount sources.")
+    if not public_key or (stage == "linux" and not nas and not nfs_source):
+        raise ValueError("Provide an enrolled SSH key and the expected Periphery NFS source.")
     name = device["name"]
     key = ssh.load_public_key(public_key)
     options = {"entware": True} if nas else {}
@@ -67,11 +67,7 @@ def host_resources(device, known_hosts, public_key, cifs_source, nfs_source, *, 
         raise ValueError(result.get("error", "Host readiness checks did not pass."))
     if stage == "periphery" or nas:
         return []
-    compose = PurePosixPath(result["compose_mount"])
-    if not compose.is_absolute() or compose.parts[-2:] != (".docker", "compose") or ".." in compose.parts:
-        raise ValueError("The target did not report a valid Compose mount.")
-    mounts = [Resource(ResourceKind.MOUNT, str(compose), Ownership.REUSED),
-              Resource(ResourceKind.MOUNT, f"/share/docker/komodo/data/{name}", Ownership.REUSED)]
+    mounts = [Resource(ResourceKind.MOUNT, f"/share/docker/komodo/data/{name}", Ownership.REUSED)]
     if mounts_only:
         return mounts
     network_id = result.get("owned_network")

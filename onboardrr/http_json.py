@@ -2,6 +2,7 @@
 
 import http.client
 import json
+import ssl
 from urllib.parse import urlsplit
 
 
@@ -12,6 +13,10 @@ class HttpStatusError(ValueError):
     def __init__(self, service, operation, status):
         self.status = status
         super().__init__(f"{service} {operation} failed with HTTP {status}.")
+
+
+class HttpTransportError(ValueError):
+    """An HTTPS request failed before a complete response arrived."""
 
 
 class JsonService:
@@ -50,7 +55,9 @@ class JsonService:
                 return json.loads(content)
             except ValueError as error:
                 raise ValueError(f"{self.name} {operation} returned invalid JSON.") from error
+        except ssl.SSLCertVerificationError as error:
+            raise ValueError(f"{self.name} {operation} could not verify the TLS certificate.") from error
         except (OSError, http.client.HTTPException) as error:
-            raise ValueError(f"{self.name} {operation} could not complete over HTTPS.") from error
+            raise HttpTransportError(f"{self.name} {operation} could not complete over HTTPS.") from error
         finally:
             connection.close()

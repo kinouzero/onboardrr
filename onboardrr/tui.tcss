@@ -180,11 +180,11 @@ Screen {
     color: $accent;
     text-style: bold;
 }
-#guide-hint, #action-hint, #periphery-paths {
+#guide-hint, #action-hint, #periphery-paths, #dns-detection {
     height: auto;
     color: $onboardrr-muted;
 }
-#start-add, #start-ssh, #load-compose-files, #back-to-action {
+#start-add, #start-ssh, #load-compose-files, #detect-dns, #back-to-action {
     width: 30;
     max-width: 100%;
 }

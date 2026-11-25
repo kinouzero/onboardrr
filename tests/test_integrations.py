@@ -345,7 +345,7 @@ class LinuxPrepareTest(unittest.TestCase):
             ):
                 self.assertEqual(
                     prepare_linux(device, known_hosts, "//goku/compose", "goku:/data/lab", bao,
-                                  become_password="sudo-fixture"),
+                                  become_password="sudo-fixture", optional_mounts={"dev": "//goku/dev"}),
                     {"device": "lab", "mode": "check"},
                 )
                 self.assertEqual(lookup.call_args.args, ("ansible-playbook",))

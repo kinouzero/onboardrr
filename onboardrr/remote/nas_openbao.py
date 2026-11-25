@@ -16,6 +16,7 @@ def docker(*arguments):
     environment = os.environ.copy()
     for name in ("DOCKER_CONTEXT", "DOCKER_HOST", "COMPOSE_FILE", "COMPOSE_PROJECT_NAME", "HOSTNAME"):
         environment.pop(name, None)
+    environment.setdefault("DOCKER_CONFIG", str(Path.home() / ".docker"))
     environment["COMPOSE_REMOVE_ORPHANS"] = "false"
     try:
         return subprocess.check_output(["docker", *arguments], env=environment, text=True,
@@ -59,16 +60,22 @@ def write_private(path, contents):
     return True
 
 
-def agent_service(variant, image, label, root):
+def agent_service(variant, request, root):
     name = f"openbao-agent-{variant}"
     output = "cache" if variant == "compose" else "rendered"
     arguments = ["agent", "-config=/agent/agent.hcl"]
+    device = request["device"]
+    transport, endpoint = (
+        ("socket", "/var/run/docker.sock") if request.get("kuma_local")
+        else ("tcp", f'http://{request["address"]}:{request["port"]}')
+    )
+    label = ", ".join(json.dumps(value) for value in (device, transport, endpoint))
     return {
-        "container_name": name, "image": image, "restart": "always",
+        "container_name": name, "image": request["image"], "restart": "always",
         "user": f"{os.getuid()}:{os.getgid()}",
         "labels": {
-            "docker.stack": "secrets", "homepage.href": "${URL_BAO}",
-            "homepage.group": "Docker ${DOCKER_HOSTNAME}", "homepage.icon": "sh-openbao",
+            "docker.stack": "secrets", "homepage.href": request["agent"]["url"].replace("$", "$$"),
+            "homepage.group": f"Docker {device}", "homepage.icon": "sh-openbao",
             "homepage.name": name, "komodo.skip": "", "kuma.__docker": label,
             "wud.display.icon": "sh-openbao", "wud.display.name": name,
             "wud.link.template": "https://github.com/" + (
@@ -88,7 +95,7 @@ def agent_service(variant, image, label, root):
     }
 
 
-def legacy_deployment(root, variant):
+def legacy_deployment(root, variant, compose):
     name = f"openbao-agent-{variant}"
     identifiers = docker("ps", "-aq", "--filter", f"name=^/{name}$").split()
     if not identifiers:
@@ -102,7 +109,10 @@ def legacy_deployment(root, variant):
     if labels.get("com.docker.compose.project") != "secrets" or labels.get("com.docker.compose.service") != name:
         raise conflict
     config = labels.get("com.docker.compose.project.config_files")
-    if config == str(root / "compose.yaml"):
+    if config in {str(root / "compose.yaml"), str(compose)} or (
+        config and Path(config).parent.parent == compose.parent
+        and Path(config).name == "compose.openbao-agent.yaml"
+    ):
         return None
     legacy = root.with_name("compose-openbao")
     legacy_config = legacy / "compose.yaml"
@@ -132,13 +142,14 @@ def legacy_deployment(root, variant):
 
 def install(request):
     root = Path.home() / ".config/docker/openbao"
-    compose, env = root / "compose.yaml", root / "compose.env"
+    workspace = Path.home() / ".docker/compose"
+    compose, env = workspace / "compose.openbao.yml", root / "compose.env"
     agent = request["agent"]
-    label = '"${DOCKER_HOSTNAME}", "tcp", "http://${HOST_IP}:${DOCKER_API_PORT}"'
     variants = {"compose": agent, **({"komodo": agent["komodo"]} if "komodo" in agent else {})}
-    previous = [deployment for variant in variants if (deployment := legacy_deployment(root, variant))]
+    previous = [deployment for variant in variants if (deployment := legacy_deployment(root, variant, compose))]
     for path in (root.parent.parent, root.parent, root):
         directory(path)
+    workspace.mkdir(parents=True, mode=0o700, exist_ok=True)
     services, rendered, credentials_changed = {}, {}, False
     for variant, credentials in variants.items():
         base = root / variant
@@ -148,7 +159,7 @@ def install(request):
         credentials_changed |= write_private(base / "agent/agent.hcl", b64decode(credentials["config_b64"], validate=True))
         credentials_changed |= write_private(base / "agent/role-id", (credentials["role_id"] + "\n").encode())
         credentials_changed |= write_private(base / "agent/secret-id", (credentials["secret_id"] + "\n").encode())
-        services[f"openbao-agent-{variant}"] = agent_service(variant, request["image"], label, base)
+        services[f"openbao-agent-{variant}"] = agent_service(variant, request, base)
         names = [f"{item}.env" for item in credentials["projects"]] if variant == "compose" else ["core.config.toml"]
         for name in names:
             if not re.fullmatch(r"[a-z0-9][a-z0-9_.-]+", name):

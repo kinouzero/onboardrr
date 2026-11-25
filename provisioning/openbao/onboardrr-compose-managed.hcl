@@ -1,6 +1,6 @@
 # Add to the existing controller ACL after creating the managed auth mount.
 path "hosts/data/+/compose-agent" {
-  capabilities = ["read", "create"]
+  capabilities = ["read", "create", "patch"]
 }
 
 path "hosts/metadata/+/compose" {

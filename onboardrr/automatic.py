@@ -12,6 +12,7 @@ from time import monotonic, sleep
 from .http_json import HttpStatusError
 from .inventory import NAS_PROFILE, PROFILE, SERVER_PROFILE
 from .pangolin_network import destination_ipv4
+from .platform_stacks import PLATFORM_PROFILES
 from .primary_storage import storage_endpoint
 from .progress import emit
 from .reconcile import host_resources
@@ -32,20 +33,26 @@ MONITORING_OPTIONS = {name: (label, ALL_PROFILES) for name, label in (
     ("prometheus", "Configure Prometheus"), ("dozzle", "Configure Dozzle"),
 )}
 PREPARE_COMPONENTS = ("system", "docker", "bluetooth", "docker-auth", "nvidia", "vnc", "openbao-agent", "goku-mounts")
+PLATFORM_INSTALL = {"openbao-server": "openbao", "authentik-server": "authentik", "komodo-server": "komodo",
+                    "pangolin-server": "pangolin"}
 INSTALL = {
     "ssh": ("Configure SSH", ALL_PROFILES),
     "wifi": ("Enable Wi-Fi", (PROFILE,)),
     "system": ("Configure the system", ALL_PROFILES),
     "usb-storage": ("Mount USB storage", (PROFILE,)),
     "docker": ("Install Docker", ALL_PROFILES),
+    "openbao-server": ("Install OpenBao Server", PLATFORM_PROFILES["openbao"]),
     "bluetooth": ("Enable Bluetooth", LINUX),
     "docker-auth": ("Authenticate with Docker Hub", ALL_PROFILES),
     "nvidia": ("NVIDIA drivers", (SERVER_PROFILE,)),
     "vnc": ("VNC remote desktop", (SERVER_PROFILE,)),
     "openbao-agent": ("OpenBao agent", ALL_PROFILES),
+    **{component: (f"Install {label}", PLATFORM_PROFILES[PLATFORM_INSTALL[component]])
+       for component, label in (("authentik-server", "Authentik"), ("komodo-server", "Komodo Core"),
+                                ("pangolin-server", "Pangolin"))},
     "komodo": ("Configure Komodo", ALL_PROFILES),
     "goku-files": ("Stage files and export on Goku", ALL_PROFILES),
-    "goku-mounts": ("SMB and NFS mounts", ALL_PROFILES),
+    "goku-mounts": ("Periphery NFS storage", ALL_PROFILES),
     "periphery": ("Periphery agent", ALL_PROFILES),
     "pangolin": ("Configure Pangolin", ALL_PROFILES),
     "docker-proxy": ("Docker proxy", ALL_PROFILES),
@@ -108,9 +115,7 @@ def defaults(command, device):
             selected.add("bluetooth")
         if not primary:
             selected.update(("komodo", "goku-files", "goku-mounts", "periphery", *INSTALL_ALIASES["services"]))
-        if os.environ.get("ONBOARDRR_BAO_AGENT_TOKEN_FILE") or (
-            not primary and os.environ.get("ONBOARDRR_BAO_URL")
-        ):
+        if os.environ.get("ONBOARDRR_BAO_AGENT_TOKEN_FILE") or os.environ.get("ONBOARDRR_BAO_URL"):
             selected.add("openbao-agent")
         if os.environ.get("ONBOARDRR_BAO_URL"):
             selected.add("docker-auth")
@@ -301,8 +306,22 @@ class Automation:
             self.advance("usb-storage")
         for component in PREPARE_COMPONENTS:
             if component in selected and component not in {"system", "goku-mounts"}:
-                self.prepare_once(component)
-                self.advance(component)
+                if component != "openbao-agent" or not selected.intersection(PLATFORM_INSTALL.keys() - {"openbao-server"}):
+                    self.prepare_once(component)
+                    self.advance(component)
+            if component == "docker" and "openbao-server" in selected:
+                report = self.call(INSTALL["openbao-server"][0], "install-stack", "openbao", name, "--apply",
+                                   *self.key, *self.trust)
+                self.advance("openbao-server")
+                if report.get("next_action") and selected.intersection(
+                    {"openbao-agent", "docker-auth", *PLATFORM_INSTALL} - {"openbao-server"},
+                ):
+                    raise Blocked(report["next_action"])
+        for component, stack in PLATFORM_INSTALL.items():
+            if component != "openbao-server" and component in selected:
+                self.call(INSTALL[component][0], "install-stack", stack, name, "--apply", *self.key, *self.trust,
+                          *self.sudo)
+                self.advance("openbao-agent", component)
         if self.checkpoint() == "nas-prepare" and selected.intersection((
             "komodo", "goku-files", "goku-mounts", "periphery", *INSTALL_ALIASES["services"],
         )):
@@ -560,20 +579,24 @@ def check_selection(automation, install):
     if "termix" in selected and not os.environ.get("ONBOARDRR_TERMIX_URL"):
         raise Blocked("Configure termix_url in the controller settings before selecting Termix.")
     if install:
-        if selected & {"ssh", "usb-storage", "komodo", "goku-files", "goku-mounts", "periphery", "verify"} or (
+        if selected & {"ssh", "usb-storage", "komodo", "goku-files", "goku-mounts", "periphery", "verify",
+                       *PLATFORM_INSTALL} or (
             automation.device["profile"] == NAS_PROFILE and selected.intersection(PREPARE_COMPONENTS)
         ):
             if not args.public_key:
                 raise Blocked("Select the operator's SSH public key.")
         if automation.name == "zero" and selected.intersection(("komodo", "goku-files", "periphery", *BASELINE_COMPONENTS)):
             raise Blocked("The primary Komodo server does not use the secondary server deployment.")
+        if "komodo-server" in selected and selected & {"komodo", "goku-files", "goku-mounts", "periphery"}:
+            raise Blocked("Select either Komodo Core or the secondary Periphery installation.")
         if "wifi" in selected and not args.wifi_band:
             raise Blocked("Select the 2G or 5G Wi-Fi band.")
         if "wifi" in selected and not os.environ.get("ONBOARDRR_BAO_URL"):
             raise Blocked("Configure OpenBao before selecting Wi-Fi.")
         if "usb-storage" in selected and not args.usb_device:
             raise Blocked("Select a USB volume using its stable device path from USB storage preview.")
-        if "openbao-agent" in selected and not os.environ.get("ONBOARDRR_BAO_URL"):
+        if ("openbao-server" not in selected and selected.intersection({"openbao-agent", *PLATFORM_INSTALL})
+                and not os.environ.get("ONBOARDRR_BAO_URL")):
             raise Blocked("Configure the existing OpenBao controller connection before selecting the agent.")
         if selected.intersection(MONITORING) and not os.environ.get("ONBOARDRR_MONITORING_HOST"):
             raise Blocked("Configure central monitoring first.")

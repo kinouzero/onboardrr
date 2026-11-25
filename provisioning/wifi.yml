@@ -39,6 +39,13 @@
       changed_when: false
       check_mode: false
 
+    - name: Read whether the Wi-Fi radio is hardware blocked
+      ansible.builtin.command:
+        argv: [nmcli, -g, WIFI-HW, radio]
+      register: onboardrr_wifi_hardware
+      changed_when: false
+      check_mode: false
+
     - name: Read active NetworkManager profiles
       ansible.builtin.command:
         argv: [nmcli, -t, -f, "UUID,DEVICE", connection, show, --active]
@@ -61,6 +68,7 @@
           wifi_interface: "{{ onboardrr_wifi_interface }}"
           wifi_type: "{{ onboardrr_wifi_types.results[1].stdout }}"
           wifi_radio: "{{ onboardrr_wifi_radio.stdout }}"
+          wifi_hardware: "{{ onboardrr_wifi_hardware.stdout }}"
           wifi_active: "{{ onboardrr_wifi_previous_uuid != '' }}"
           wifi_band_requested: "{{ onboardrr_wifi_band | default(None) }}"
 
@@ -72,11 +80,15 @@
             that:
               - onboardrr_wifi_types.results[0].stdout == 'ethernet'
               - onboardrr_wifi_types.results[1].stdout == 'wifi'
-              - onboardrr_wifi_radio.stdout == 'enabled'
               - >-
                 not onboardrr_wifi_previous_uuid or onboardrr_wifi_previous_uuid in
                 (onboardrr_wifi_switchable_uuids | default([onboardrr_wifi_uuid]))
-            fail_msg: Use wired SSH with an enabled Wi-Fi adapter. An active profile outside Onboardrr cannot be replaced.
+            fail_msg: Use wired SSH with a Wi-Fi adapter. An active profile outside Onboardrr cannot be replaced.
+
+        - name: Require a radio that can be enabled
+          ansible.builtin.assert:
+            that: onboardrr_wifi_hardware.stdout == 'enabled'
+            fail_msg: The Wi-Fi radio is hardware blocked or unavailable. Check the adapter and hardware radio switch.
 
         - name: Check the wired IPv4 and IPv6 route metrics
           ansible.builtin.command:
@@ -97,7 +109,7 @@
           become: true
           block:
             - name: Verify the previously active profile comes from the managed keyfile
-              when: onboardrr_wifi_previous_uuid and onboardrr_wifi_previous_uuid != onboardrr_wifi_uuid
+              when: onboardrr_wifi_previous_uuid != '' and onboardrr_wifi_previous_uuid != onboardrr_wifi_uuid
               block:
                 - name: Read NetworkManager profile locations
                   ansible.builtin.command:
@@ -148,6 +160,38 @@
                 argv: [nmcli, connection, load, "{{ onboardrr_wifi_path }}"]
               when: onboardrr_wifi_copy.changed or (onboardrr_wifi_uuid ~ ':' ~ onboardrr_wifi_interface) not in onboardrr_wifi_connections.stdout_lines
               changed_when: onboardrr_wifi_copy.changed
+
+            - name: Enable the Wi-Fi radio without auto-activating a saved profile
+              when: onboardrr_wifi_radio.stdout == 'disabled'
+              block:
+                - name: Read the wireless device autoconnect state
+                  ansible.builtin.command:
+                    argv: [nmcli, -g, GENERAL.AUTOCONNECT, device, show, "{{ onboardrr_wifi_interface }}"]
+                  register: onboardrr_wifi_autoconnect
+                  changed_when: false
+                  failed_when: onboardrr_wifi_autoconnect.rc != 0 or onboardrr_wifi_autoconnect.stdout not in ['yes', 'no']
+
+                - name: Pause autoconnect on the wireless device
+                  ansible.builtin.command:
+                    argv: [nmcli, device, set, "{{ onboardrr_wifi_interface }}", autoconnect, 'no']
+                  when: onboardrr_wifi_autoconnect.stdout == 'yes'
+                  register: onboardrr_wifi_autoconnect_pause
+                  changed_when: true
+
+                - name: Turn on the Wi-Fi radio
+                  ansible.builtin.command:
+                    argv: [nmcli, radio, wifi, 'on']
+                  register: onboardrr_wifi_radio_enable
+                  changed_when: true
+
+                - name: Wait for the Wi-Fi radio to be enabled
+                  ansible.builtin.command:
+                    argv: [nmcli, radio, wifi]
+                  register: onboardrr_wifi_radio_ready
+                  until: onboardrr_wifi_radio_ready.stdout == 'enabled'
+                  retries: 5
+                  delay: 1
+                  changed_when: false
 
             - name: Activate the profile on the wireless interface
               ansible.builtin.command:
@@ -201,17 +245,32 @@
                 argv: [nmcli, --wait, '25', connection, up, uuid, "{{ onboardrr_wifi_previous_uuid }}",
                        ifname, "{{ onboardrr_wifi_interface }}"]
               when:
-                - onboardrr_wifi_previous_uuid and onboardrr_wifi_previous_uuid != onboardrr_wifi_uuid
+                - onboardrr_wifi_previous_uuid != '' and onboardrr_wifi_previous_uuid != onboardrr_wifi_uuid
                 - onboardrr_wifi_activation is defined and not (onboardrr_wifi_activation.skipped | default(false))
               register: onboardrr_wifi_restore
               failed_when: false
               changed_when: onboardrr_wifi_restore.rc == 0
+
+            - name: Return the radio to its previous disabled state on failure
+              ansible.builtin.command:
+                argv: [nmcli, radio, wifi, 'off']
+              when: onboardrr_wifi_radio_enable is defined and not (onboardrr_wifi_radio_enable.skipped | default(false))
+              register: onboardrr_wifi_radio_restore
+              failed_when: false
+              changed_when: onboardrr_wifi_radio_restore.rc == 0
 
             - name: Report that Wi-Fi activation could not be verified
               ansible.builtin.fail:
                 msg: >-
                   Wi-Fi configuration failed verification. Check the regulatory country, band, network, and credentials over Ethernet.
                   {{ 'The previous Wi-Fi profile could not be restored.' if (onboardrr_wifi_restore.rc | default(0)) != 0 else '' }}
+                  {{ 'The previous radio state could not be restored.' if (onboardrr_wifi_radio_restore.rc | default(0)) != 0 else '' }}
+          always:
+            - name: Restore the wireless device autoconnect state
+              ansible.builtin.command:
+                argv: [nmcli, device, set, "{{ onboardrr_wifi_interface }}", autoconnect, 'yes']
+              when: onboardrr_wifi_autoconnect_pause.changed | default(false)
+              changed_when: true
 
         - name: Show the verified wireless address
           ansible.builtin.debug:

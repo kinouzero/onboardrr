@@ -1,13 +1,15 @@
 """Inspect Komodo and prepare a server for Periphery enrollment."""
 
 import json
+import logging
 import re
 from hmac import compare_digest
-from ipaddress import ip_address
+from ipaddress import IPv4Address, ip_address
 from secrets import token_urlsafe
-from urllib.parse import urlsplit
+from time import sleep
+from urllib.parse import urlsplit, urlunsplit
 
-from .http_json import HttpStatusError, JsonService
+from .http_json import HttpStatusError, HttpTransportError, JsonService
 from .inventory import NAS_PROFILE, PROFILE, SERVER_PROFILE
 from .runs import Failure, Ownership, Resource, ResourceKind
 from .storage import device_lock
@@ -16,6 +18,7 @@ from .storage import device_lock
 REGISTRATION_STEP = "komodo-registration"
 MONGO_ID = re.compile(r"[0-9a-f]{24}")
 SERVER_TAGS = {PROFILE: "rpi", SERVER_PROFILE: "server", NAS_PROFILE: "nas"}
+LOGGER = logging.getLogger(__name__)
 
 
 def add_resource_tags(api, kind, identifier, required):
@@ -47,10 +50,20 @@ class Komodo:
         }
 
     def _request(self, route, action, parameters=None):
-        return self.service.request(
-            "POST", route, headers=self.headers, operation=action,
-            data={"type": action, "params": parameters or {}},
-        )
+        data = {"type": action, "params": parameters or {}}
+        # Komodo uses POST for read-only RPCs as well as mutations.
+        delays = iter((2, 5)) if route == "/read" else iter(())
+        while True:
+            try:
+                return self.service.request("POST", route, headers=self.headers, operation=action, data=data)
+            except (HttpStatusError, HttpTransportError) as error:
+                if isinstance(error, HttpStatusError) and error.status not in {408, 502, 503, 504}:
+                    raise
+                delay = next(delays, None)
+                if delay is None:
+                    raise
+                LOGGER.info("%s Retrying in %s seconds.", error, delay)
+                sleep(delay)
 
     def version(self):
         result = self._request("/read", "GetVersion")
@@ -114,6 +127,40 @@ class Komodo:
         if existing and (existing.get("template") or existing["info"].get("address") != address):
             raise ValueError("The device name is already used by a different Komodo server.")
         return existing
+
+    def sync_periphery_ip(self, name, address, *, apply):
+        servers = self._request("/read", "ListServers", {"limit": 0})
+        matches = [server for server in servers if server["name"].casefold() == name.casefold()]
+        if len(matches) > 1:
+            raise ValueError("Multiple Komodo servers match this device name.")
+        if not matches or matches[0].get("template"):
+            return {}
+        identifier = matches[0]["id"]
+        if not MONGO_ID.fullmatch(identifier):
+            raise ValueError("Komodo returned an invalid server ID.")
+        server = self._request("/read", "GetServer", {"server": identifier})
+        current = server["config"].get("address") or ""
+        endpoint = urlsplit(current)
+        if (not endpoint.hostname or endpoint.scheme not in {"http", "https", "ws", "wss"}
+                or endpoint.username is not None or endpoint.query or endpoint.fragment):
+            return {}
+        try:
+            previous = IPv4Address(endpoint.hostname)
+        except ValueError:
+            return {}
+        address = IPv4Address(address)
+        if previous == address or previous.is_loopback or previous.is_unspecified:
+            return {}
+        authority = str(address) if endpoint.port is None else f"{address}:{endpoint.port}"
+        updated = urlunsplit(endpoint._replace(netloc=authority))
+        if any(item["id"] != identifier and item["info"].get("address") == updated for item in servers):
+            raise ValueError("Another Komodo server uses the new Periphery address.")
+        if apply:
+            self._request("/write", "UpdateServer", {"id": identifier, "config": {"address": updated}})
+            saved = self._request("/read", "GetServer", {"server": identifier})
+            if saved["config"].get("address") != updated:
+                raise ValueError("Komodo did not save the new Periphery address.")
+        return {"komodo_periphery_address": updated}
 
     def register(self, name, address, passkey, *, allow_create=True):
         existing = self.existing_server(name, address)

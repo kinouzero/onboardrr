@@ -56,7 +56,12 @@ def inspect_mount(target, expected):
 
 
 def matches_outbound(container, files, outbound_file, device):
-    if not outbound_file or files != [outbound_file] or container.get("Name") != "/komodo-agent":
+    if not outbound_file or len(files) != 1 or container.get("Name") != "/komodo-agent":
+        return False
+    legacy = Path(outbound_file)
+    workspace = legacy.parents[3] / ".docker/compose" / device / "periphery/compose.yaml"
+    canonical = legacy.parents[3] / ".docker/compose/compose.komodo.yml"
+    if files[0] not in {str(legacy), str(workspace), str(canonical)}:
         return False
     environment = set(container["Config"].get("Env") or [])
     data = f"/share/docker/komodo/data/{device}"
@@ -164,7 +169,8 @@ def retire_shell_aliases(path, name, profile, *, apply):
         expected.append(b'alias cdconfig=\'cd "$HOME/.config/docker"\'')
     legacy_dcu = f'alias dcu=\'bash "$HOME/scripts/docker-env-generate-and-up.sh" {name}\''.encode()
     managed_dcu = b"alias dcu='/usr/local/bin/onboardrr-dcu'"
-    if text[start + 1:end] not in (expected, [*expected, legacy_dcu], [*expected, managed_dcu]):
+    current = [b'alias cdcompose=\'cd "$HOME/.docker/compose"\'', *expected[1:]]
+    if text[start + 1:end] not in (expected, [*expected, legacy_dcu], [*expected, managed_dcu], [*current, managed_dcu]):
         return {"status": "review"}
     if not apply:
         return {"status": "eligible"}
@@ -272,8 +278,11 @@ def detach(path, request):
     before = path.read_bytes()
     after = fstab_plan(before, mounts)
     active = [target for target, expected in mounts.items() if inspect_mount(target, expected)]
+    outbound_file = request.get("outbound_file")
+    if not outbound_file and (operator := request.get("outbound_operator")):
+        outbound_file = str(Path(pwd.getpwnam(operator).pw_dir) / ".config/onboardrr/periphery/compose.yaml")
     agent, attached = inspect_containers(
-        mounts, request.get("compose_file"), request["stop_periphery"], outbound_file=request.get("outbound_file"),
+        mounts, request.get("compose_file"), request["stop_periphery"], outbound_file=outbound_file,
         device=request.get("device"), owns_outbound=request.get("owns_outbound", False),
     )
     blockers = []

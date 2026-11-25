@@ -229,8 +229,8 @@ creates it from the existing Komodo variable or a single LAN IPv4 address
 resolved from the inventory target. OpenBao stores the address as a literal
 IPv4 string in the `value` field. Older `HOST_IP` records can supply this
 value when the `IP` record is missing. Apply creates the Komodo IP variable
-when Core does not already expose it. The controller needs read and create
-on `hosts/data/+/IP` and read on the older `hosts/data/+/HOST_IP` path.
+when Core does not already expose it. Grant `read`, `create`, and `patch` on
+`hosts/data/+/IP` and `read` on the older `hosts/data/+/HOST_IP` path.
 Separate conflicting values require review.
 Replace `DEVICE` with the uppercase device name and use underscores for
 hyphens. The Docker API proxy listens on this LAN
@@ -670,13 +670,12 @@ with the device's Onboardrr identity. Termix retains the shared credential.
 
 In **Maintenance**, choose **Update Compose files via WUD**.
 Select the SSH key, load the host's files, and select one or more entries.
-Onboardrr searches `~/.docker/compose/<device>`, the older
-`~/.config/docker/compose/<device>` layout, or the default Compose directory
-when no host subdirectory exists.
+Onboardrr lists Compose files directly in `~/.docker/compose` on the selected
+host. The action uses the same files for WUD updates and deployment.
 
 ```sh
 onboardrr compose-update lab-pi --list-files --public-key ~/.ssh/id_ed25519.pub
-onboardrr compose-update lab-pi --file compose.yaml --file media/docker-compose.yml \
+onboardrr compose-update lab-pi --file compose.komodo.yml --file compose.openbao.yml \
   --public-key ~/.ssh/id_ed25519.pub
 ```
 
@@ -693,6 +692,15 @@ and leaves unrelated services alone. If a deployment fails after the files
 are written, the output lists the saved files and the failed project.
 Reapplying can deploy an already-saved tag when WUD still advertises the
 update for the running container.
+
+For the Komodo database, select `compose.komodo.yml`. WUD tracks both
+images, and the preview waits for compatible FerretDB and DocumentDB tags
+on the same PostgreSQL major version. Applying stops Komodo Core and
+FerretDB, starts PostgreSQL with the selected DocumentDB image, and updates
+and verifies the installed DocumentDB extension before starting FerretDB
+and Core in order. If a step fails, reapply the action to resume the saved
+pair. The deployed-project shortcut directs database updates to this
+file-based action.
 
 ### Update by deployed project name
 
@@ -803,7 +811,9 @@ controller to override the default port. Kuma uses `/var/run/docker.sock`
 on `zero` and the generated TCP address on the other hosts. Both agent
 variants belong to the Docker Compose project `secrets` and use the
 `docker.stack: secrets` label. Preparation starts only the requested agent
-service within that project.
+service within that project. The generated Compose file includes the host
+name, Homepage URL, and Kuma connection details so the labels resolve when
+the agent is recreated without a Compose environment file.
 
 On Zero, both agents join the existing `zero` Docker network and connect to
 OpenBao at `http://openbao:8200`. Hosts without an internal endpoint use
@@ -814,7 +824,10 @@ mapping. Use a trusted Docker network local to that host with OpenBao already
 reachable at the configured address.
 
 The agent renews authentication and renders owner-only `0600` files in
-`~/.config/docker/openbao/compose/cache`. Managed Compose agents render `USER`
+`~/.config/docker/openbao/compose/cache`. Docker checks that every configured
+output is a readable, nonempty file without opening it. An existing render can
+remain readable during an OpenBao outage, so this check covers rendered files
+only. Managed Compose agents render `USER`
 from `hosts/common/USER`. The managed AppRole needs read access to that exact
 path. On re-preparation, the legacy managed
 agent is stopped after the new cache is verified. Installations still using
@@ -825,6 +838,7 @@ directory, run:
 
 ```sh
 dcu
+dcu komodo --dry-run
 dcu --project-name my-project --pull always
 ```
 
@@ -838,6 +852,88 @@ missing or has unsafe permissions. Use `--project-name` if the project name
 depends on interpolation, or `--file` to select a Compose file explicitly.
 The launcher also recognizes `--project-directory`, `--profile`, and
 `--env-file`. Additional options go to `docker compose up`.
+Use `dcu NAME` to select `compose.NAME.yml` in the current directory. The launcher uses `NAME` as the project name
+unless `--project-name` is supplied. For named projects it loads the managed
+OpenBao `config` environment when available. The named Komodo Compose file
+also loads the managed `periphery` environment. Use `--dry-run` to preview
+what Compose would change.
+When Periphery is deployed from `compose.komodo.yml`, `dcu komodo` reuses its
+installed project's environment.
+
+Onboardrr writes generated files directly in `~/.docker/compose`.
+`compose.komodo.yml` contains outbound Periphery or the complete Komodo project
+when Komodo Core is selected. `compose.openbao.yml` contains the Compose Agent
+and also contains the Komodo Agent when Core is installed. The OpenBao project
+name remains `secrets`, including when launched with `dcu openbao`. Keys,
+AppRole credentials, and rendered secrets stay in their private directories.
+
+### Install a platform stack
+
+Choose **Install OpenBao Server**, **Install Authentik**, **Install Komodo Core**, or **Install Pangolin**
+in the TUI, or preview with `onboardrr install-stack STACK DEVICE --public-key
+~/.ssh/zero.pub`. Use `--apply` to prepare OpenBao and deploy the stack. The
+reference comes from `/share/compose/zero/docker-compose.STACK.yml` on the
+primary NAS. The installer saves `compose.STACK.yml` and reads its variables
+from the private OpenBao cache. Add stack-specific variables to
+`hosts/<device>/compose/<stack>` in split KV mode. The preview names missing
+variables. Restore the Pangolin configuration before applying its stack.
+
+The generated Authentik, Komodo, and Pangolin manifests sort services, service
+fields, and environment variables alphabetically. The installer keeps
+healthcheck commands inline and reuses the stack's default network. Traefik
+shares Gerbil's network namespace.
+
+The Pangolin publications use `PANGOLIN_HTTP_PORT`, `PANGOLIN_HTTPS_PORT`,
+`PANGOLIN_WIREGUARD_PORT`, and `PANGOLIN_EXTRA_UDP_PORT`. Set these in the
+OpenBao Compose environment to override the ports from the NAS reference.
+The generated platform environment supplies the reference values when an
+override is absent.
+
+When generating a platform stack, Periphery, or an OpenBao agent, Onboardrr
+checks the target's local Docker engine for an Uptime Kuma container. A
+present container selects the `socket` macro, including when stopped.
+Otherwise it selects `tcp` using the target's IP and the configured Docker
+API port. The check runs when Onboardrr generates the Compose manifest.
+
+
+Authentik, Komodo Core, and Pangolin are available for every profile. OpenBao
+Server is available for Raspberry Pi and Linux server profiles. NAS deployments
+use the local Container Station Docker engine. The OpenBao agents remain
+available on NAS.
+
+Select **Install OpenBao Server** or run
+`onboardrr install-stack openbao DEVICE --public-key ~/.ssh/zero.pub`.
+The installer reads `/share/compose/zero/docker-compose.secrets.yml` and
+adds OpenBao Server and PostgreSQL to `compose.openbao.yml`, preserving any
+agents already configured. The Compose project is named `secrets`.
+Applying starts the server and database. An agent refresh preserves both
+service definitions, including their configured image versions. When the
+server is present, agent preparation connects through the Docker network.
+
+Restore the server HCL and any referenced seal material under
+`~/.config/docker/openbao/config/`. Put the bootstrap settings in
+`~/.config/docker/openbao/bootstrap/openbao.env` and the corresponding
+PostgreSQL credentials in `openbao-postgres.env` in the same directory.
+Keep both environment files private (mode `0600`). The server reads these
+files directly, so it can start before OpenBao is available. A fresh vault
+must be initialized and, if sealed, unsealed before the agents can connect.
+Select **OpenBao agent** to configure the Compose Agent once its AppRole
+and controller access are available.
+
+Komodo prepares its dedicated OpenBao Agent before starting Core and embeds
+the rendered configuration and watcher mounts in `compose.komodo.yml`.
+For fresh Raspberry Pi installations and hosts whose CPU lacks the features
+required by current MongoDB images, Onboardrr uses FerretDB and PostgreSQL
+DocumentDB. Supply `POSTGRES_PASSWORD` through the host's OpenBao Compose
+environment for Core, FerretDB, and PostgreSQL. Existing databases retain their
+backend and require a compatible restore when moved to different hardware.
+FerretDB and DocumentDB are pinned as a pair and tracked by WUD.
+For hosts without an existing Core AppRole, enable `onboardrr-komodo` once,
+install the [Core policy](../provisioning/openbao/onboardrr-komodo-core.hcl),
+and add the [managed Core rules](../provisioning/openbao/onboardrr-komodo-managed.hcl)
+and updated [Compose bootstrap rules](../provisioning/openbao/onboardrr-compose-managed.hcl)
+to the controller policy. Each subsequent Core installation issues its host
+identity automatically.
 
 For existing projects, `onboardrr compose-update` also uses the managed
 environment file automatically. Secret changes refresh the rendered files.
@@ -949,22 +1045,21 @@ signed APT repository for Debian Trixie or Ubuntu Noble. Mint 22.x uses its
 Noble base. An existing Docker installation retains its package source.
 
 Use `prepare DEVICE --system-only` for local preparation. For full preparation
-provide the same Compose SMB and Periphery NFS sources as the Raspberry Pi.
+provide the same Periphery NFS source as the Raspberry Pi. The host's Compose
+workspace is local under `~/.docker/compose`.
 Additional shares and kernel settings are opt-in and can be selected per host.
 
 ```sh
 python3 -m onboardrr prepare lab-server \
-  --cifs-source //goku.local/compose \
   --nfs-source goku.local:/docker/komodo/data/lab-server \
   --dev-source //goku.local/dev \
-  --scripts-source //goku.local/scripts \
   --downloads-source //goku.local/downloads \
   --inotify-instances 1024 \
   --swappiness 1
 ```
 
 The extra mounts use the same OpenBao SMB credentials and conflict checks.
-Their destinations are `~/dev`, `~/scripts`, and `~/downloads`.
+Their destinations are `~/dev` and `~/downloads`.
 `--plex-source` is also available for `/mnt/goku_plex`. Requested kernel values
 are stored in dedicated files under `/etc/sysctl.d` and applied immediately.
 
@@ -1043,15 +1138,14 @@ onboardrr prepare lab-nas --public-key ~/.ssh/operator.pub \
 Onboardrr stages the deployment files in `/share/compose/<nas>` on the
 primary storage NAS over SSH. The primary NAS links `~/.docker/compose`
 to its local share and binds its local Periphery directory. A secondary
-NAS mounts the primary Compose share over SMB at `~/.docker/compose`
-and its dedicated Periphery export over NFS at
+NAS keeps its Compose workspace local and mounts its dedicated Periphery export over NFS at
 `/share/docker/komodo/data/<nas>`, as on a Raspberry Pi. Container
 Station also uses that export directly for the agent volume, so an agent
 start before the host mount cannot use an empty local directory.
 Onboardrr stores the mount configuration privately and uses QTS's
-persistent crontab to retry the mounts after reboot. It uses QTS's native
+persistent crontab to retry the NFS mount after reboot. It uses QTS's native
 `/usr/bin/crontab` and verifies the recovery job after reloading cron. The secondary setup
-requires QTS sudo and the primary NAS SMB credential in OpenBao.
+requires QTS sudo.
 QTS reports changes in mount restoration state to the system log with
 the `onboardrr-mounts` tag. Restarts verify the permissions on the
 private configuration before loading it.
@@ -1077,8 +1171,7 @@ which Komodo's OpenBao Agent renders as `STORAGE_IP`. Apply the updated
 controller policy in `provisioning/openbao/onboardrr-read.hcl` to grant
 access to this key. A generated Komodo Agent uses that same path in the
 split layout and needs read access. The selected inventory host supplies
-the SSH endpoint, username, and port. On Linux profiles, SMB and NFS
-defaults use the stored IPv4.
+the SSH endpoint, username, and port. The Periphery NFS mount defaults to the stored IPv4.
 In the split layout, put the replacement NAS credentials in
 `hosts/<device>/smb` as `smb_username` and `smb_password`.
 
@@ -1097,8 +1190,10 @@ needed. Use a supported 2.4 GHz network with a Raspberry Pi 3 Model B. A 3B+ als
 supports 5 GHz.
 
 `onboardrr wifi DEVICE` runs a read-only check, including when the connection
-already uses Wi-Fi. Apply from a wired SSH session with `--apply` and the
-adapter enabled. Use `--band 2G` or `--band 5G` to select the shared OpenBao
+already uses Wi-Fi. Apply from a wired SSH session with `--apply`. Onboardrr
+enables the radio if it is disabled in software and restores that state if
+activation fails. A hardware-blocked or missing radio needs attention on the
+Pi. Use `--band 2G` or `--band 5G` to select the shared OpenBao
 entry and lock the profile to that band. Without a band, OpenBao uses the
 legacy per-device entry if present. Without OpenBao, the command prompts for
 credentials in the terminal. Add `--interface` for an adapter named
@@ -1114,6 +1209,42 @@ were. An active profile created outside Onboardrr is preserved. Switching
 between managed bands retains the earlier profile and attempts to reconnect
 it if the new activation fails.
 
+When OpenBao is configured, a successful Wi-Fi activation records the Wi-Fi
+IPv4 address in `hosts/<device>/IP`. Choose **Maintenance → Disable Wi-Fi**
+or run `onboardrr wifi DEVICE --disable --apply` to switch back. Onboardrr
+opens a trusted SSH session to the Ethernet IPv4 address before disabling
+the radio, verifies the wired session afterward, and writes the Ethernet
+IPv4 address to the same OpenBao entry. Omit `--apply` to verify the wired
+endpoint in preview.
+
+With Komodo configured, the switch first updates the IPv4 in the server's
+Periphery URL, preserving its scheme, port, and other server settings.
+Hostname-based URLs and outbound agents keep their existing settings.
+The switch also refreshes deployed Komodo stacks
+that reference the host-specific IP variable, such as `NARUTO_IP`. It
+waits for Komodo to load the verified address. Stopped stacks remain stopped,
+and a retry resumes incomplete deployments without replaying completed ones
+for that address. For OpenBao-rendered Core secrets, `komodo_core_device`
+selects the Core host from the inventory and defaults to `zero`. Its SSH
+operator needs Docker inspection access and read access to the rendered Core
+configuration. Docker Compose projects managed outside Komodo are separate.
+
+To refresh the address without changing either network, choose **Maintenance
+→ Sync host IP and stacks** or run `onboardrr wifi DEVICE --sync --apply`.
+Onboardrr uses the active Wi-Fi IPv4 address when available and otherwise
+verifies the wired IPv4 endpoint. Preview shows the selected address, any
+Periphery URL change, and the dependent Komodo stacks. Apply writes the
+address to OpenBao, updates the Periphery URL when needed, and resumes the
+targeted redeployments. The action repairs existing Periphery NFS mounts and
+updates their NFS client authorization before saving the new address. It uses
+the actual source IPv4 for the NAS route, which can differ from the host's
+published IPv4 when both network interfaces are connected, and remembers it
+in the `nas_client_ipv4` field of the same OpenBao record. It also starts
+an existing NFS-backed Periphery container if it is stopped. Repairing fstab
+or mounting shares requires passwordless sudo on the device.
+Onboardrr retries Komodo reads during temporary HTTPS failures, including when
+Core reloads. Each deployment request is submitted once per attempt.
+
 ## References
 
 - [OpenBao HTTP authentication](https://openbao.org/api-docs/)
@@ -1126,3 +1257,60 @@ it if the new activation fails.
 - [NetworkManager keyfile settings](https://networkmanager.dev/docs/api/latest/nm-settings-keyfile.html)
 - [Docker Compose up](https://docs.docker.com/reference/cli/docker/compose/up/)
 - [WUD REST API and version tracking](https://getwud.app/)
+
+
+## Synchronize databases with Portabase
+
+In **Maintenance**, choose **Sync databases with Portabase** for a host
+with a running Portabase agent. Preview inspects database containers over
+SSH. Apply updates the agent's JSON configuration under its bind-mounted
+`/config` and restarts only the agent, and only when the file changes. The
+agent registers the sources on its next report.
+
+```sh
+onboardrr portabase-sync zero --public-key ~/.ssh/zero.pub
+onboardrr portabase-sync zero --public-key ~/.ssh/zero.pub --apply
+```
+
+Discovery recognizes PostgreSQL, MySQL, MariaDB, MongoDB, Redis, Valkey,
+Microsoft SQL Server, and Firebird on Docker networks shared with the
+Portabase agent. It uses database settings already present in the container's
+deployment environment. Use `onboardrr.portabase.database` and
+`onboardrr.portabase.port` for nonstandard settings or
+`onboardrr.portabase.skip: "true"` to exclude the container. Onboardrr
+preserves manual entries, dashboard-managed sources already recorded by
+Onboardrr, and stopped database containers. It tracks its own source IDs
+in a separate private file next to the agent configuration.
+
+When an Onboardrr-managed Docker service disappears, Apply removes its
+source from the agent file. The dashboard retains its historical record.
+**Delete backups for removed sources** is off by default. Select it or pass
+`--purge-backups` to delete archives via the Portabase API for retired managed
+sources. Cleanup skips sources with backups queued or running.
+
+For automatic project assignment and optional backup cleanup, enable the Portabase API and
+store `api_token` in `services/portabase/onboardrr` in OpenBao, or pass
+`PORTABASE_API_KEY` to the Onboardrr process through its environment.
+The controller also accepts `portabase_api_token_file` for a private file
+containing the token. The dashboard URL comes from the agent's Edge Key
+unless `portabase_url` is set.
+Onboardrr keeps existing assignments. For unassigned local Docker sources it
+matches the Compose project name first, then uses the existing project of the
+same application or matches the `docker.stack` label. Ambiguous and unmatched
+sources are reported and left unassigned. Set `portabase_project_id` or pass
+`--project UUID` to apply a single project to unassigned Onboardrr-managed
+sources. Re-run the action if the agent has yet to report a source to the
+dashboard.
+
+To create missing projects automatically, set `portabase_policy_project` in
+`~/.config/onboardrr/config.toml` to the unique name of an active reference
+project, such as `medias`. When a valid Compose project has neither a matching
+Portabase project nor an existing assignment for the same application,
+Onboardrr creates it in the reference project's organization. The agent must
+already belong to that organization. Onboardrr copies and verifies the
+backup schedule, retention, storage, and notification policies before linking
+the first database. Any channels selected on the reference project must be
+available to the organization. Existing project policies are preserved.
+
+See [Portabase agent configuration](https://portabase.io/docs/agent/configuration)
+and the [Portabase REST API](https://portabase.io/docs/dashboard/api/introduction).

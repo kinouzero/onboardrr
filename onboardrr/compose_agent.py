@@ -16,6 +16,7 @@ from .secrets import PATH_SEGMENT, OpenBao, configured_openbao, deployment_kv_pa
 APPROLE_ID = re.compile(r"[A-Za-z0-9_-]{1,256}")
 MANAGED_AUTH = "onboardrr-compose"
 MANAGED_POLICY = "onboardrr-compose-host"
+KOMODO_AUTH = "onboardrr-komodo"
 BOOTSTRAP_FIELDS = (
     "role_id", "secret_id", "projects", "docker_api_port", "host_ip", "komodo_role_id",
     "komodo_secret_id", "komodo_common_mount", "komodo_newt_mount", "auth_mount",
@@ -194,7 +195,43 @@ def compose_controller():
     return bao
 
 
-def configured_compose_agent(device, *, ensure=False):
+def provision_core_identity(bao, device, path, record, version):
+    role_name = f"{device}-komodo-core"
+    policy = "onboardrr-komodo-core"
+    role = f"/v1/auth/{KOMODO_AUTH}/role/{role_name}"
+
+    def request(method, route, data=None):
+        return bao.service.request(method, route, headers=bao.headers, operation="Komodo Agent bootstrap", data=data)
+
+    try:
+        identity = request("GET", role + "/role-id")
+    except HttpStatusError as error:
+        if error.status != 404:
+            raise
+        request("POST", role, {"bind_secret_id": True, "token_no_default_policy": True,
+                               "token_policies": policy, "token_period": "3600"})
+        identity = request("GET", role + "/role-id")
+    issued = request("POST", role + "/secret-id", {})["data"]
+    credentials = {"role_id": identity["data"]["role_id"], "secret_id": issued["secret_id"]}
+    saved = False
+    try:
+        auth = bao.service.request("POST", f"/v1/auth/{KOMODO_AUTH}/login", headers={},
+                                   operation="verify Komodo Agent identity", data=credentials)["auth"]
+        bao.service.request("POST", "/v1/auth/token/revoke-self", headers={"X-Vault-Token": auth["client_token"]},
+                            operation="revoke bootstrap verification token", data={})
+        if auth.get("policies") != [policy] or auth.get("metadata", {}).get("role_name") != role_name:
+            raise ValueError("The Komodo OpenBao AppRole does not have the expected dedicated policy.")
+        fields = {"komodo_role_id": credentials["role_id"], "komodo_secret_id": credentials["secret_id"],
+                  "komodo_auth_mount": KOMODO_AUTH}
+        bao.patch(path, fields, version=version)
+        saved = True
+        return {**record, **fields}
+    finally:
+        if not saved:
+            request("POST", role + "/secret-id-accessor/destroy", {"secret_id_accessor": issued["secret_id_accessor"]})
+
+
+def configured_compose_agent(device, *, ensure=False, require_core=False, render_project=None):
     credential_file = os.environ.get("ONBOARDRR_BAO_AGENT_TOKEN_FILE")
     if not credential_file and not ensure:
         return None
@@ -208,7 +245,7 @@ def configured_compose_agent(device, *, ensure=False):
            if credential_file else compose_controller())
     path = f"deployments/compose-agent/{device}"
     try:
-        record, _ = bao.fields_with_version(path, *BOOTSTRAP_FIELDS)
+        record, version = bao.fields_with_version(path, *BOOTSTRAP_FIELDS)
     except HttpStatusError as error:
         if error.status != 404:
             raise
@@ -216,6 +253,9 @@ def configured_compose_agent(device, *, ensure=False):
             raise ValueError(f"Configure the OpenBao Compose Agent bootstrap record for {device}.") from None
         try:
             record = managed_bootstrap(compose_controller() if credential_file else bao, device, path, layout=layout)
+            version = None
+            if require_core or render_project:
+                record, version = bao.fields_with_version(path, *BOOTSTRAP_FIELDS)
         except HttpStatusError as failure:
             if failure.status in (403, 404):
                 raise ValueError("Configure the shared managed Compose AppRole mount and controller policy in OpenBao.") from None
@@ -227,6 +267,28 @@ def configured_compose_agent(device, *, ensure=False):
         raise ValueError("The OpenBao Compose Agent bootstrap record is incomplete.")
     role_id, secret_id = record["role_id"], record["secret_id"]
     projects = sorted({name.strip() for name in record["projects"].split(",")})
+    if require_core and not (record.get("komodo_role_id") and record.get("komodo_secret_id")):
+        try:
+            record = provision_core_identity(compose_controller(), device, path, record, version)
+        except HttpStatusError as error:
+            if error.status in {403, 404}:
+                raise ValueError("Configure the managed Komodo AppRole mount and controller policy in OpenBao.") from None
+            raise
+        _, version = bao.fields_with_version(path, *BOOTSTRAP_FIELDS)
+    if render_project and render_project not in projects:
+        controller = compose_controller()
+        metadata = deployment_kv_path(controller.mount, f"deployments/compose/{device}", metadata=True, layout=layout)
+        try:
+            registered = controller.service.request("LIST", f"/v1/{metadata}", headers=controller.headers,
+                                                    operation="List agent Compose projects")["data"]["keys"]
+        except HttpStatusError as error:
+            if error.status != 404:
+                raise
+            registered = []
+        if render_project in registered:
+            projects = sorted([*projects, render_project])
+            validate_projects(projects)
+            controller.patch(path, {"projects": ",".join(projects)}, version=version)
     validate_projects(projects)
     port = record.get("docker_api_port", os.environ.get("ONBOARDRR_DOCKER_API_PORT"))
     if port is not None:

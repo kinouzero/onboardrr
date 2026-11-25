@@ -1,0 +1,51 @@
+---
+- name: Switch the Raspberry Pi back to Ethernet
+  hosts: all
+  gather_facts: false
+  serial: 1
+  environment:
+    LC_ALL: C
+  tasks:
+    - name: Read the current SSH connection
+      ansible.builtin.setup:
+        filter: ansible_env
+
+    - name: Require the verified Ethernet endpoint for this SSH session
+      ansible.builtin.assert:
+        that:
+          - (ansible_facts.env.SSH_CONNECTION | default('')).split() | length == 4
+          - ansible_facts.env.SSH_CONNECTION.split()[2] == onboardrr_ethernet_address
+        fail_msg: The SSH session must use the verified Ethernet IPv4 address.
+
+    - name: Inspect the current SSH route
+      ansible.builtin.command:
+        argv: [ip, -j, route, get, "{{ ansible_facts.env.SSH_CONNECTION.split()[0] }}", from, "{{ onboardrr_ethernet_address }}"]
+      register: onboardrr_ethernet_route
+      changed_when: false
+
+    - name: Verify the SSH route uses Ethernet
+      ansible.builtin.assert:
+        that: (onboardrr_ethernet_route.stdout | from_json)[0].dev == onboardrr_ethernet_interface
+        fail_msg: Wi-Fi can only be disabled while the SSH route uses Ethernet.
+
+    - name: Read the Wi-Fi radio state
+      ansible.builtin.command:
+        argv: [nmcli, radio, wifi]
+      register: onboardrr_wifi_radio
+      changed_when: false
+
+    - name: Disable the Wi-Fi radio
+      ansible.builtin.command:
+        argv: [nmcli, radio, wifi, 'off']
+      become: true
+      changed_when: true
+      when: onboardrr_wifi_radio.stdout != 'disabled'
+
+    - name: Verify Wi-Fi has been disabled
+      ansible.builtin.command:
+        argv: [nmcli, radio, wifi]
+      register: onboardrr_wifi_disabled
+      until: onboardrr_wifi_disabled.stdout == 'disabled'
+      retries: 5
+      delay: 1
+      changed_when: false

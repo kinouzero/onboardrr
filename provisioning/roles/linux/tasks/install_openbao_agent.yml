@@ -4,6 +4,7 @@
   remote_user: "{{ onboardrr_user }}"
   vars:
     onboardrr_agent_name: "openbao-agent-{{ onboardrr_agent_variant }}"
+    onboardrr_agent_compose_file: "{{ onboardrr_home }}/.docker/compose/compose.openbao.yml"
     onboardrr_previous_agent_id: "{{ onboardrr_previous_project_agent.stdout.split() | first | default('') }}"
     onboardrr_previous_agent_archived: "{{ onboardrr_previous_project_agent.stdout.endswith(' ' ~ onboardrr_agent_name ~ '-previous') }}"
   block:
@@ -35,12 +36,49 @@
       register: onboardrr_agent_configuration
       no_log: true
 
+    - name: Create the host's local Compose workspace
+      ansible.builtin.file:
+        path: "{{ onboardrr_agent_compose_file | dirname }}"
+        state: directory
+        follow: false
+
+    - name: Inspect the current secrets Compose manifest
+      ansible.builtin.stat:
+        path: "{{ onboardrr_agent_compose_file }}"
+        follow: false
+      register: onboardrr_secrets_manifest
+
+    - name: Verify that the secrets Compose manifest is private
+      ansible.builtin.assert:
+        that:
+          - onboardrr_secrets_manifest.stat.isreg
+          - onboardrr_secrets_manifest.stat.uid == onboardrr_account[1] | int
+          - onboardrr_secrets_manifest.stat.mode == '0600'
+        quiet: true
+      when: onboardrr_secrets_manifest.stat.exists
+
+    - name: Read the current secrets Compose manifest
+      ansible.builtin.slurp:
+        src: "{{ onboardrr_agent_compose_file }}"
+      register: onboardrr_secrets_source
+      when: onboardrr_secrets_manifest.stat.exists
+      no_log: true
+
     - name: Install the host-specific OpenBao Agent Compose
-      ansible.builtin.template:
-        src: openbao-agent.compose.yaml.j2
-        dest: "{{ onboardrr_agent_directory }}/compose.yaml"
+      vars:
+        onboardrr_secrets_current: "{{ onboardrr_secrets_source.content | default('e30=') | b64decode | from_yaml }}"
+        onboardrr_secrets_agents: "{{ lookup('ansible.builtin.template', 'openbao-agent.compose.yaml.j2') | from_yaml }}"
+      ansible.builtin.copy:
+        content: >-
+          {{ (onboardrr_secrets_current | combine(onboardrr_secrets_agents, recursive=true)
+               | combine({'services': onboardrr_secrets_current.services | combine(onboardrr_secrets_agents.services)})
+               | to_nice_yaml(indent=2, sort_keys=false, width=4096))
+             if 'openbao' in onboardrr_secrets_current.services | default({})
+             else lookup('ansible.builtin.template', 'openbao-agent.compose.yaml.j2') }}
+        dest: "{{ onboardrr_agent_compose_file }}"
         mode: "0600"
         follow: false
+      diff: false
 
     - name: Find the same agent under its previous project name
       ansible.builtin.command:
@@ -82,7 +120,7 @@
                        'docker', '--host', 'unix:///var/run/docker.sock', 'compose', '--ansi', 'never',
                        '--project-name', 'secrets',
                        '--env-file', onboardrr_openbao_directory ~ '/compose.env',
-                       '--file', onboardrr_agent_directory ~ '/compose.yaml', 'up', '--no-deps', '--wait', '--wait-timeout', '45']
+                       '--file', onboardrr_agent_compose_file, 'up', '--no-deps', '--wait', '--wait-timeout', '45']
                        + (['--force-recreate'] if onboardrr_agent_configuration.changed else []) + [onboardrr_agent_name] }}"
           environment:
             COMPOSE_REMOVE_ORPHANS: "false"

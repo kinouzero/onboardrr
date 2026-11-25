@@ -1,5 +1,17 @@
 name: secrets
 services:
+{% set render_check -%}
+files=$$(awk -F '"' '/^[[:space:]]*"destination"[[:space:]]*:/ { print $4 } /^[[:space:]]*destination[[:space:]]*=/ { print $2 }' /agent/agent.hcl) || exit 1;
+test -n "$$files" || exit 1;
+for file in $$files; do
+case "$$file" in /cache/*.env|/rendered/core.config.toml) ;; *) exit 1;; esac;
+test -f "$$file" && test -s "$$file" && test -r "$$file" || exit 1;
+done
+{%- endset %}
+{% for agent in onboardrr_agent_specs | default([{'variant': onboardrr_agent_variant, 'directory': onboardrr_agent_directory, 'output': onboardrr_agent_output}]) %}
+{% set onboardrr_agent_variant = agent.variant %}
+{% set onboardrr_agent_directory = agent.directory %}
+{% set onboardrr_agent_output = agent.output %}
   openbao-agent-{{ onboardrr_agent_variant }}:
 {% if onboardrr_agent_variant == 'komodo' %}
     cap_drop: [ALL]
@@ -8,18 +20,24 @@ services:
     command: [agent, -config=/agent/agent.hcl]
 {% endif %}
     container_name: openbao-agent-{{ onboardrr_agent_variant }}
+    healthcheck:
+      interval: 30s
+      retries: 3
+      start_period: 45s
+      test: ["CMD-SHELL", {{ render_check | replace('\n', ' ') | to_json }}]
+      timeout: 5s
     image: ghcr.io/openbao/openbao:2.7.3
     labels:
       docker.stack: secrets
-      homepage.href: ${URL_BAO}
-      homepage.group: Docker ${DOCKER_HOSTNAME}
+      homepage.href: {{ onboardrr_compose_agent.url | replace('$', '$$') | to_json }}
+      homepage.group: {{ ('Docker ' ~ onboardrr_name) | to_json }}
       homepage.icon: sh-openbao
       homepage.name: openbao-agent-{{ onboardrr_agent_variant }}
       komodo.skip:
-{% if onboardrr_name == 'zero' %}
-      kuma.__docker: '"${DOCKER_HOSTNAME}", "socket", "/var/run/docker.sock"'
+{% if (onboardrr_kuma.stdout | from_json).local %}
+      kuma.__docker: '"{{ onboardrr_name }}", "socket", "/var/run/docker.sock"'
 {% else %}
-      kuma.__docker: '"${DOCKER_HOSTNAME}", "tcp", "http://${HOST_IP}:${DOCKER_API_PORT}"'
+      kuma.__docker: '"{{ onboardrr_name }}", "tcp", "http://{{ onboardrr_openbao_host_ip }}:{{ onboardrr_openbao_docker_api_port | int }}"'
 {% endif %}
       wud.display.icon: sh-openbao
       wud.display.name: openbao-agent-{{ onboardrr_agent_variant }}
@@ -43,6 +61,7 @@ services:
       - type: bind
         source: {{ (onboardrr_agent_directory ~ '/' ~ onboardrr_agent_output) | replace('$', '$$') | to_json }}
         target: /{{ onboardrr_agent_output }}
+{% endfor %}
 {% if onboardrr_openbao_internal_endpoint %}
 networks:
   openbao:

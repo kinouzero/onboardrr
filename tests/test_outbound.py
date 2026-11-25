@@ -43,6 +43,10 @@ class OutboundRecoveryTest(unittest.TestCase):
         self.enterContext(patch("onboardrr.ssh.agent_identity", side_effect=lambda key: nullcontext()))
         self.enterContext(patch("onboardrr.ssh.connect", side_effect=lambda *a, **k: nullcontext()))
         self.enterContext(patch("onboardrr.ssh.script", side_effect=self.remote))
+        self.enterContext(patch("onboardrr.outbound.kuma_on_host", return_value=False))
+        self.enterContext(patch("onboardrr.outbound.kuma_tcp_values", return_value={
+            "HOST_IP": "192.0.2.10", "DOCKER_API_PORT": "2380",
+        }))
 
     def request(self, route, action, params=None):
         self.requests.append((route, action, params))
@@ -171,13 +175,10 @@ class OutboundWorkerTest(unittest.TestCase):
     @unittest.skipUnless(shutil.which("openssl"), "OpenSSL is required to test X25519 key generation")
     def test_worker_stages_private_key_once_and_refuses_untrusted_mounts(self):
         home = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        share = home / ".docker" / "compose" / "lab"
-        share.mkdir(parents=True)
-        (share / "docker-compose.komodo.yml").write_text("services:\n  komodo-agent:\n    image: ignored\n")
-        (share / "template.env").write_text("DOCKER_HOSTNAME='lab'\n{{_KOMODO_SECRETS}}\n")
         request = {"action": "stage", "device": "lab", "version": "2.3.4",
                    "device_id": "fixture-device-id",
                    "core_url": "https://komodo.example.org", "core_public_key": fixture_key(3),
+                   "docker_endpoint": "http://192.0.2.10:2380",
                    "cifs_source": "//goku/compose", "nfs_source": "goku:/lab"}
         with patch.object(worker.Path, "home", return_value=home), patch.object(worker, "mount_matches") as mount:
             mount.return_value = False
@@ -187,7 +188,17 @@ class OutboundWorkerTest(unittest.TestCase):
             with patch.object(worker, "output", return_value=""):
                 first = worker.recover_outbound(request)
                 second = worker.recover_outbound(request)
+                worker.recover_outbound({**request, "kuma_local": True})
         self.assertEqual(first["public_key"], second["public_key"])
         root = home / ".config" / "onboardrr" / "periphery"
         self.assertEqual((root / "keys" / "periphery.key").stat().st_mode & 0o777, 0o600)
-        self.assertEqual((root / "compose.yaml").stat().st_mode & 0o777, 0o600)
+        compose = home / ".docker/compose/compose.komodo.yml"
+        self.assertEqual(compose.stat().st_mode & 0o777, 0o600)
+        self.assertFalse((root / "compose.yaml").exists())
+        labels = json.loads(compose.read_text())["services"]["komodo-agent"]["labels"]
+        self.assertEqual(labels["docker.stack"], "komodo")
+        self.assertEqual(labels["homepage.group"], "Docker lab")
+        self.assertEqual(labels["kuma.__docker"], '"lab", "socket", "/var/run/docker.sock"')
+        self.assertEqual(worker.periphery_labels("zero", request["core_url"], request["docker_endpoint"])["kuma.__docker"],
+                         '"zero", "tcp", "http://192.0.2.10:2380"')
+        self.assertEqual(labels["wud.tag.include"], r"^\d+\.\d+\.\d+$$")

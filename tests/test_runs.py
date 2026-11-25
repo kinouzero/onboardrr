@@ -26,7 +26,9 @@ class RunStoreTest(unittest.TestCase):
                                (run_id,))
             connection.execute("UPDATE runs SET finished_at = 'legacy' WHERE id = ?", (run_id,))
             connection.execute("DROP TABLE primary_storage")
-            connection.execute(f"PRAGMA user_version = {len(MIGRATIONS) - 2}")
+            connection.execute("DROP TABLE host_ip_stack_deployments")
+            connection.execute("DROP TABLE portabase_dashboard_sources")
+            connection.execute("PRAGMA user_version = 7")
         upgraded = self.store.open("nas")
         self.assertEqual((upgraded["id"], upgraded["next_step"]), (run_id, "komodo-registration"))
         steps = self.store.show(run_id)["steps"]
