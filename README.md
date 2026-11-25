@@ -31,7 +31,7 @@ x86-64 and ARM64 on Ubuntu 22.04 and macOS Intel and Apple Silicon on macOS
 Python distributions to PyPI. A manual run on `master` builds preview
 artifacts. Each binary archive and wheel includes a SHA-256 checksum.
 
-Install the wheel with `pipx install ./onboardrr-0.1.1-py3-none-any.whl`.
+Install the wheel with `pipx install ./onboardrr-0.1.2-py3-none-any.whl`.
 For a native archive, extract it and run `./onboardrr` or put the executable
 in a directory on your `PATH`.
 
